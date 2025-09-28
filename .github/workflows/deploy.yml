@@ -411,7 +411,7 @@ jobs:
             MCP_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`${{ env.MCP_ENDPOINT_PATH_PART }}`].[id]' --output text | head -1)
             if [ ! -z "$MCP_ID" ]; then
               aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
-              aws apigateway update-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --patch-ops op=replace,path=/authorizationType,value=${{ env.AUTHORIZATION_TYPE }}
+              aws apigateway update-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --patch-ops '[{"op": "replace", "path": "/authorizationType", "value": "'${{ env.AUTHORIZATION_TYPE }}'"}]'
             fi
             
             # Update health endpoint
