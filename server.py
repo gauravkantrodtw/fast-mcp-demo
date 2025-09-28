@@ -9,7 +9,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Create FastMCP server instance
+# Create FastMCP server instance with proper configuration
 mcp = FastMCP("daap-mcp-server")
 
 # Import tools so they get registered via decorators
@@ -22,6 +22,36 @@ import tools
 async def health_check(request):
     """Health check endpoint for monitoring."""
     return {"status": "healthy", "service": "daap-mcp-server"}
+
+# Add resource support (FastMCP standard)
+@mcp.resource("system://status")
+def get_system_status() -> dict:
+    """Returns the current operational status of the service."""
+    return {
+        "status": "operational",
+        "service": "daap-mcp-server",
+        "version": "1.0.0",
+        "tools_available": 3,
+        "uptime": "active"
+    }
+
+@mcp.resource("system://info")
+def get_server_info() -> dict:
+    """Returns detailed information about the MCP server."""
+    return {
+        "name": "daap-mcp-server",
+        "description": "A FastMCP server providing greeting tools and utilities for data analysis and processing.",
+        "capabilities": {
+            "tools": True,
+            "resources": True,
+            "logging": True
+        },
+        "supported_tools": [
+            "say_hello",
+            "say_goodbye", 
+            "get_greeting_info"
+        ]
+    }
 
 # For local development
 if __name__ == "__main__":

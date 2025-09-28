@@ -15,13 +15,19 @@ from server import mcp
 @handle_errors("Hello greeting", reraise=True)
 def say_hello(name: str = "World") -> str:
     """
-    Say hello to someone.
+    Say hello to someone with a friendly greeting message.
+    
+    This tool generates a personalized greeting message with an emoji.
+    It's useful for creating welcoming messages in applications or workflows.
     
     Args:
-        name: The name to greet (default: "World")
+        name: The name of the person to greet (default: "World")
         
     Returns:
-        A friendly greeting message
+        A friendly greeting message with the person's name and a wave emoji
+        
+    Example:
+        say_hello("Alice") -> "Hello, Alice! 👋"
     """
     logger.info(f"Generating hello greeting for: {name}")
     

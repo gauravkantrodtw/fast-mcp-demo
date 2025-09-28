@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MCPProxy:
-    def __init__(self, api_gateway_url: str, region: str = "eu-central-1"):
+    def __init__(self, api_gateway_url: str, region: str):
         self.api_gateway_url = api_gateway_url
         self.region = region
         

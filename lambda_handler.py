@@ -254,6 +254,10 @@ async def process_mcp_request(request):
                     "capabilities": {
                         "tools": {
                             "listChanged": False
+                        },
+                        "resources": {
+                            "subscribe": False,
+                            "listChanged": False
                         }
                     },
                     "serverInfo": {
@@ -265,7 +269,86 @@ async def process_mcp_request(request):
         
         elif method == 'notifications/initialized':
             # This is a notification, so no response needed
+            logger.info("Client initialized successfully")
             return None
+        
+        elif method == 'resources/list':
+            # List available resources
+            resources = await mcp.get_resources()
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": uri,
+                            "name": resource.name if hasattr(resource, 'name') else uri.split('://')[-1],
+                            "description": resource.description if hasattr(resource, 'description') else f"Resource at {uri}",
+                            "mimeType": "application/json"
+                        }
+                        for uri, resource in resources.items()
+                    ]
+                }
+            }
+        
+        elif method == 'resources/read':
+            # Read a specific resource
+            uri = params.get('uri', '')
+            if not uri:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params",
+                        "data": "Resource URI is required"
+                    }
+                }
+            
+            try:
+                resources = await mcp.get_resources()
+                if uri in resources:
+                    resource = resources[uri]
+                    # Call the resource function
+                    if hasattr(resource, 'fn'):
+                        content = resource.fn()
+                    else:
+                        content = resource()
+                    
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": "application/json",
+                                    "text": json.dumps(content, indent=2)
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "Resource not found",
+                            "data": f"Resource {uri} not found"
+                        }
+                    }
+            except Exception as e:
+                logger.error(f"Error reading resource {uri}: {e}")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": f"Failed to read resource: {str(e)}"
+                    }
+                }
         
         else:
             return {
