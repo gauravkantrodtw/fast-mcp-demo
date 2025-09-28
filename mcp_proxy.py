@@ -16,8 +16,6 @@ from urllib3.util.retry import Retry
 import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
-from botocore.credentials import get_credentials
-from botocore.session import Session
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,8 +25,21 @@ class MCPProxy:
     def __init__(self, api_gateway_url: str, region: str = "eu-central-1"):
         self.api_gateway_url = api_gateway_url
         self.region = region
-        self.session = boto3.Session()
-        self.credentials = get_credentials(self.session)
+        
+        # Get AWS profile from environment
+        profile_name = os.getenv('AWS_PROFILE')
+        
+        # Create boto3 session with profile
+        self.session = boto3.Session(profile_name=profile_name)
+        
+        # Get credentials from session
+        try:
+            self.credentials = self.session.get_credentials()
+            if not self.credentials:
+                raise ValueError(f"No credentials found for profile: {profile_name}")
+        except Exception as e:
+            logger.error(f"Failed to get AWS credentials: {e}")
+            raise
         
     def make_authenticated_request(self, method: str, path: str, body: str = None) -> Dict[str, Any]:
         """Make an authenticated request to API Gateway using AWS IAM."""
