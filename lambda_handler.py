@@ -252,7 +252,9 @@ async def process_mcp_request(request):
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
-                        "tools": {}
+                        "tools": {
+                            "listChanged": False
+                        }
                     },
                     "serverInfo": {
                         "name": "daap-mcp-server",
