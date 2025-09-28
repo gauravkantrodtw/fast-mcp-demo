@@ -1,0 +1,316 @@
+name: Cleanup AWS Resources (Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to cleanup'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm_deletion:
+        description: 'Type "DELETE" to confirm resource deletion'
+        required: true
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run (show what would be deleted without actually deleting)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      function_name: ${{ steps.set-env.outputs.function_name }}
+      api_gateway_name: ${{ steps.set-env.outputs.api_gateway_name }}
+      role_name: ${{ steps.set-env.outputs.role_name }}
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.environment }}" ]; then
+            echo "❌ Environment is required"
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.confirm_deletion }}" != "DELETE" ] && [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
+            echo "❌ Deletion not confirmed. Please type 'DELETE' to confirm or enable dry run."
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+
+      - name: Set environment variables
+        id: set-env
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          echo "function_name=daap-mcp-server-$ENV" >> $GITHUB_OUTPUT
+          echo "api_gateway_name=daap-mcp-server-api-$ENV" >> $GITHUB_OUTPUT
+          echo "role_name=daap-mcp-server-role-$ENV" >> $GITHUB_OUTPUT
+
+      - name: Validate AWS credentials
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "❌ AWS_ACCESS_KEY_ID secret is required"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ AWS_SECRET_ACCESS_KEY secret is required"
+            exit 1
+          fi
+          echo "✅ AWS credentials validated"
+
+  discover-resources:
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      lambda_exists: ${{ steps.discover.outputs.lambda_exists }}
+      api_gateway_exists: ${{ steps.discover.outputs.api_gateway_exists }}
+      role_exists: ${{ steps.discover.outputs.role_exists }}
+      api_gateway_id: ${{ steps.discover.outputs.api_gateway_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Discover existing resources
+        id: discover
+        run: |
+          echo "🔍 Discovering existing resources..."
+          
+          # Check Lambda function
+          if aws lambda get-function --function-name ${{ needs.validate.outputs.function_name }} >/dev/null 2>&1; then
+            echo "lambda_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Found Lambda function: ${{ needs.validate.outputs.function_name }}"
+          else
+            echo "lambda_exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Lambda function not found: ${{ needs.validate.outputs.function_name }}"
+          fi
+          
+          # Check API Gateway
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ needs.validate.outputs.api_gateway_name }}`].[id]' --output text | head -1)
+          if [ ! -z "$API_ID" ] && [ "$API_ID" != "None" ]; then
+            echo "api_gateway_exists=true" >> $GITHUB_OUTPUT
+            echo "api_gateway_id=$API_ID" >> $GITHUB_OUTPUT
+            echo "✅ Found API Gateway: ${{ needs.validate.outputs.api_gateway_name }} (ID: $API_ID)"
+          else
+            echo "api_gateway_exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ API Gateway not found: ${{ needs.validate.outputs.api_gateway_name }}"
+          fi
+          
+          # Check IAM role
+          if aws iam get-role --role-name ${{ needs.validate.outputs.role_name }} >/dev/null 2>&1; then
+            echo "role_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Found IAM role: ${{ needs.validate.outputs.role_name }}"
+          else
+            echo "role_exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ IAM role not found: ${{ needs.validate.outputs.role_name }}"
+          fi
+
+  cleanup-lambda:
+    needs: [validate, discover-resources]
+    if: needs.discover-resources.outputs.lambda_exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup Lambda permissions
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "🗑️ Cleaning up Lambda permissions..."
+          
+          if aws lambda get-function --function-name ${{ needs.validate.outputs.function_name }} >/dev/null 2>&1; then
+            POLICY=$(aws lambda get-policy --function-name ${{ needs.validate.outputs.function_name }} --query 'Policy' --output text 2>/dev/null || echo '{}')
+            if [ "$POLICY" != "{}" ]; then
+              echo "$POLICY" | jq -r '.Statement[] | select(.Principal.Service == "apigateway.amazonaws.com") | .Sid' | while read statement_id; do
+                if [ ! -z "$statement_id" ]; then
+                  echo "Removing permission: $statement_id"
+                  aws lambda remove-permission --function-name ${{ needs.validate.outputs.function_name }} --statement-id "$statement_id" || echo "Permission $statement_id not found"
+                fi
+              done
+              echo "✅ Lambda permissions cleaned up"
+            else
+              echo "ℹ️ No Lambda permissions found"
+            fi
+          fi
+
+      - name: Delete Lambda function
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "🗑️ Deleting Lambda function: ${{ needs.validate.outputs.function_name }}"
+          aws lambda delete-function --function-name ${{ needs.validate.outputs.function_name }}
+          echo "✅ Lambda function deleted successfully"
+
+      - name: Dry run - Lambda cleanup
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔍 DRY RUN: Would delete Lambda function: ${{ needs.validate.outputs.function_name }}"
+          echo "🔍 DRY RUN: Would remove all API Gateway invoke permissions"
+
+  cleanup-api-gateway:
+    needs: [validate, discover-resources]
+    if: needs.discover-resources.outputs.api_gateway_exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete API Gateway
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "🗑️ Deleting API Gateway: ${{ needs.validate.outputs.api_gateway_name }}"
+          aws apigateway delete-rest-api --rest-api-id ${{ needs.discover-resources.outputs.api_gateway_id }}
+          echo "✅ API Gateway deleted successfully (ID: ${{ needs.discover-resources.outputs.api_gateway_id }})"
+
+      - name: Dry run - API Gateway cleanup
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔍 DRY RUN: Would delete API Gateway: ${{ needs.validate.outputs.api_gateway_name }} (ID: ${{ needs.discover-resources.outputs.api_gateway_id }})"
+
+  cleanup-iam:
+    needs: [validate, discover-resources]
+    if: needs.discover-resources.outputs.role_exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup IAM resources
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          # Get AWS account ID
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          echo "🗑️ Cleaning up IAM resources..."
+          
+          # Function to delete IAM policy with version cleanup
+          delete_iam_policy() {
+            local policy_name=$1
+            local policy_arn="arn:aws:iam::$ACCOUNT_ID:policy/$policy_name"
+            
+            echo "Deleting IAM policy: $policy_name"
+            if aws iam get-policy --policy-arn $policy_arn >/dev/null 2>&1; then
+              # Delete all policy versions first
+              aws iam list-policy-versions --policy-arn $policy_arn --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text | tr '\t' '\n' | while read version; do
+                if [ ! -z "$version" ]; then
+                  aws iam delete-policy-version --policy-arn $policy_arn --version-id $version || echo "Failed to delete version $version"
+                fi
+              done
+              
+              # Delete the policy
+              aws iam delete-policy --policy-arn $policy_arn
+              echo "✅ IAM policy $policy_name deleted successfully"
+            else
+              echo "ℹ️ IAM policy $policy_name not found, skipping..."
+            fi
+          }
+          
+          # Detach IAM role policies
+          if aws iam get-role --role-name ${{ needs.validate.outputs.role_name }} >/dev/null 2>&1; then
+            echo "Detaching IAM role policies: ${{ needs.validate.outputs.role_name }}"
+            
+            # Detach basic execution role
+            aws iam detach-role-policy \
+              --role-name ${{ needs.validate.outputs.role_name }} \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || echo "Basic execution policy not attached"
+            
+            # Detach custom policies
+            aws iam detach-role-policy \
+              --role-name ${{ needs.validate.outputs.role_name }} \
+              --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/daap-mcp-server-s3-policy-${{ github.event.inputs.environment }} || echo "S3 policy not attached"
+            
+            aws iam detach-role-policy \
+              --role-name ${{ needs.validate.outputs.role_name }} \
+              --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/daap-mcp-server-api-policy-${{ github.event.inputs.environment }} || echo "API Gateway policy not attached"
+            
+            echo "✅ IAM role policies detached"
+            
+            # Delete IAM role
+            echo "Deleting IAM role: ${{ needs.validate.outputs.role_name }}"
+            aws iam delete-role --role-name ${{ needs.validate.outputs.role_name }}
+            echo "✅ IAM role deleted successfully"
+          fi
+          
+          # Delete IAM policies
+          delete_iam_policy "daap-mcp-server-api-policy-${{ github.event.inputs.environment }}"
+          delete_iam_policy "daap-mcp-server-s3-policy-${{ github.event.inputs.environment }}"
+          delete_iam_policy "daap-mcp-server-deployment-s3-policy-${{ github.event.inputs.environment }}"
+
+      - name: Dry run - IAM cleanup
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔍 DRY RUN: Would delete IAM role: ${{ needs.validate.outputs.role_name }}"
+          echo "🔍 DRY RUN: Would delete IAM policies:"
+          echo "   - daap-mcp-server-api-policy-${{ github.event.inputs.environment }}"
+          echo "   - daap-mcp-server-s3-policy-${{ github.event.inputs.environment }}"
+          echo "   - daap-mcp-server-deployment-s3-policy-${{ github.event.inputs.environment }}"
+          echo "🔍 DRY RUN: Would detach all policies from the role"
+
+  cleanup-summary:
+    needs: [validate, discover-resources, cleanup-lambda, cleanup-api-gateway, cleanup-iam]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Cleanup Summary
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "🔍 DRY RUN COMPLETED"
+            echo "📋 Resources that would be cleaned up:"
+          else
+            echo "🎉 Cleanup completed!"
+            echo "📋 Resources cleaned up:"
+          fi
+          
+          if [ "${{ needs.discover-resources.outputs.lambda_exists }}" == "true" ]; then
+            echo "   ✅ Lambda Function: ${{ needs.validate.outputs.function_name }}"
+            echo "   ✅ Lambda Permissions: API Gateway invoke permissions"
+          else
+            echo "   ℹ️ Lambda Function: Not found (skipped)"
+          fi
+          
+          if [ "${{ needs.discover-resources.outputs.api_gateway_exists }}" == "true" ]; then
+            echo "   ✅ API Gateway: ${{ needs.validate.outputs.api_gateway_name }}"
+          else
+            echo "   ℹ️ API Gateway: Not found (skipped)"
+          fi
+          
+          if [ "${{ needs.discover-resources.outputs.role_exists }}" == "true" ]; then
+            echo "   ✅ IAM Role: ${{ needs.validate.outputs.role_name }}"
+            echo "   ✅ IAM Policies: Environment-specific policies"
+          else
+            echo "   ℹ️ IAM Role: Not found (skipped)"
+          fi
+          
+          echo ""
+          if [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
+            echo "💡 To redeploy, run the deployment workflow or use:"
+            echo "   ./create_deployment_package.sh && aws lambda create-function ..."
+          else
+            echo "💡 To actually perform cleanup, run this workflow again with dry_run=false and confirm_deletion=DELETE"
+          fi

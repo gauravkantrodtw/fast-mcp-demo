@@ -1,0 +1,421 @@
+name: Deploy MCP Server to AWS Lambda (Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      s3_bucket:
+        description: 'S3 bucket name for data access'
+        required: true
+        default: 'databricks-dev-external-ext-str-raw-data-eu-central-1'
+        type: string
+
+env:
+  AWS_REGION: eu-central-1
+  LAMBDA_ARCHITECTURE: x86_64
+  RUNTIME: python3.12
+  MEMORY_SIZE: 1024
+  TIMEOUT: 120
+  HANDLER: lambda_handler.lambda_handler
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      function_name: ${{ steps.set-env.outputs.function_name }}
+      api_gateway_name: ${{ steps.set-env.outputs.api_gateway_name }}
+      role_name: ${{ steps.set-env.outputs.role_name }}
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.environment }}" ]; then
+            echo "❌ Environment is required"
+            exit 1
+          fi
+          if [ -z "${{ github.event.inputs.s3_bucket }}" ]; then
+            echo "❌ S3 bucket is required"
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+
+      - name: Set environment variables
+        id: set-env
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          echo "function_name=daap-mcp-server-$ENV" >> $GITHUB_OUTPUT
+          echo "api_gateway_name=daap-mcp-server-api-$ENV" >> $GITHUB_OUTPUT
+          echo "role_name=daap-mcp-server-role-$ENV" >> $GITHUB_OUTPUT
+
+      - name: Validate AWS credentials
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "❌ AWS_ACCESS_KEY_ID secret is required"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ AWS_SECRET_ACCESS_KEY secret is required"
+            exit 1
+          fi
+          echo "✅ AWS credentials validated"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Create deployment package
+        run: |
+          chmod +x create_deployment_package.sh
+          ./create_deployment_package.sh
+
+      - name: Upload deployment package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: mcp-server-deployment.zip
+
+  deploy-lambda:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment package
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload deployment package to S3
+        run: |
+          # Get AWS account ID
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          S3_BUCKET="lambda-deployment-packages-$ACCOUNT_ID"
+          
+          # Create S3 bucket if it doesn't exist
+          aws s3 mb s3://$S3_BUCKET --region ${{ env.AWS_REGION }} || echo "Bucket may already exist"
+          
+          # Upload deployment package to S3
+          S3_KEY="mcp-server-deployment-${{ github.event.inputs.environment }}-$(date +%s).zip"
+          aws s3 cp mcp-server-deployment.zip s3://$S3_BUCKET/$S3_KEY
+          
+          # Store S3 location for Lambda deployment
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "S3_KEY=$S3_KEY" >> $GITHUB_ENV
+
+      - name: Deploy Lambda function
+        run: |
+          # Get AWS account ID
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          # Check if function exists
+          if aws lambda get-function --function-name ${{ needs.validate.outputs.function_name }} >/dev/null 2>&1; then
+            echo "🔄 Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name ${{ needs.validate.outputs.function_name }} \
+              --s3-bucket ${{ env.S3_BUCKET }} \
+              --s3-key ${{ env.S3_KEY }}
+          else
+            echo "🆕 Creating new Lambda function..."
+            
+            # Create IAM role
+            aws iam create-role \
+              --role-name ${{ needs.validate.outputs.role_name }} \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Principal": {
+                      "Service": "lambda.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                  }
+                ]
+              }' || echo "Role may already exist"
+            
+            # Attach basic execution policy
+            aws iam attach-role-policy \
+              --role-name ${{ needs.validate.outputs.role_name }} \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
+            
+            # Create S3 policy for data access
+            S3_POLICY_ARN=$(aws iam create-policy \
+              --policy-name "daap-mcp-server-s3-policy-${{ github.event.inputs.environment }}" \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:ListBucket"],
+                    "Resource": [
+                      "arn:aws:s3:::${{ github.event.inputs.s3_bucket }}",
+                      "arn:aws:s3:::${{ github.event.inputs.s3_bucket }}/*"
+                    ]
+                  }
+                ]
+              }' \
+              --query 'Policy.Arn' \
+              --output text 2>/dev/null)
+            
+            # Create S3 policy for deployment packages
+            DEPLOYMENT_S3_BUCKET="lambda-deployment-packages-$ACCOUNT_ID"
+            S3_DEPLOYMENT_POLICY_ARN=$(aws iam create-policy \
+              --policy-name "daap-mcp-server-deployment-s3-policy-${{ github.event.inputs.environment }}" \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": "arn:aws:s3:::'$DEPLOYMENT_S3_BUCKET'/*"
+                  }
+                ]
+              }' \
+              --query 'Policy.Arn' \
+              --output text 2>/dev/null)
+            
+            if [ -z "$S3_POLICY_ARN" ]; then
+              S3_POLICY_ARN=$(aws iam get-policy --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/daap-mcp-server-s3-policy-${{ github.event.inputs.environment }}" --query 'Policy.Arn' --output text 2>/dev/null)
+            fi
+            
+            if [ ! -z "$S3_POLICY_ARN" ]; then
+              aws iam attach-role-policy \
+                --role-name ${{ needs.validate.outputs.role_name }} \
+                --policy-arn $S3_POLICY_ARN || echo "S3 policy may already be attached"
+            fi
+            
+            if [ ! -z "$S3_DEPLOYMENT_POLICY_ARN" ]; then
+              aws iam attach-role-policy \
+                --role-name ${{ needs.validate.outputs.role_name }} \
+                --policy-arn $S3_DEPLOYMENT_POLICY_ARN || echo "S3 deployment policy may already be attached"
+            fi
+            
+            # Wait for role to be ready
+            sleep 10
+            
+            # Create Lambda function
+            ROLE_ARN=$(aws iam get-role --role-name ${{ needs.validate.outputs.role_name }} --query 'Role.Arn' --output text)
+            aws lambda create-function \
+              --function-name ${{ needs.validate.outputs.function_name }} \
+              --runtime ${{ env.RUNTIME }} \
+              --role $ROLE_ARN \
+              --handler ${{ env.HANDLER }} \
+              --code S3Bucket=${{ env.S3_BUCKET }},S3Key=${{ env.S3_KEY }} \
+              --architecture ${{ env.LAMBDA_ARCHITECTURE }} \
+              --memory-size ${{ env.MEMORY_SIZE }} \
+              --timeout ${{ env.TIMEOUT }}
+          fi
+
+      - name: Wait for Lambda to be ready
+        run: |
+          echo "⏳ Waiting for Lambda function to be ready..."
+          for i in {1..30}; do
+            STATE=$(aws lambda get-function --function-name ${{ needs.validate.outputs.function_name }} --query 'Configuration.State' --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i: Function state is $STATE"
+            if [ "$STATE" = "Active" ]; then
+              echo "✅ Function is ready!"
+              break
+            elif [ "$STATE" = "Failed" ]; then
+              echo "❌ Function creation failed!"
+              exit 1
+            fi
+            sleep 10
+          done
+          
+          if [ "$STATE" != "Active" ]; then
+            echo "❌ Function did not become active within 5 minutes"
+            exit 1
+          fi
+
+  deploy-api-gateway:
+    needs: [validate, deploy-lambda]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy API Gateway
+        run: |
+          # Get AWS account ID and Lambda ARN
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          LAMBDA_ARN=$(aws lambda get-function --function-name ${{ needs.validate.outputs.function_name }} --query 'Configuration.FunctionArn' --output text)
+          
+          # Check if API Gateway already exists
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ needs.validate.outputs.api_gateway_name }}`].[id]' --output text | head -1)
+          
+          if [ -z "$API_ID" ]; then
+            echo "🆕 Creating new API Gateway..."
+            API_ID=$(aws apigateway create-rest-api --name ${{ needs.validate.outputs.api_gateway_name }} --query 'id' --output text)
+            ROOT_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[0].id' --output text)
+            
+            # Create endpoints
+            MCP_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part mcp --query 'id' --output text)
+            HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
+            
+            # Configure methods
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method POST --authorization-type AWS_IAM
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type AWS_IAM
+            
+            # Configure integrations
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method POST --type AWS_PROXY --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type AWS_PROXY --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            
+            # Deploy API Gateway
+            aws apigateway create-deployment --rest-api-id $API_ID --stage-name ${{ github.event.inputs.environment }}
+            
+            # Add Lambda permissions
+            MCP_STATEMENT_ID="apigateway-invoke-$(date +%s)"
+            HEALTH_STATEMENT_ID="apigateway-invoke-health-$(date +%s)"
+            
+            aws lambda add-permission \
+              --function-name ${{ needs.validate.outputs.function_name }} \
+              --statement-id $MCP_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/POST/mcp" || echo "MCP permission may already exist"
+            
+            aws lambda add-permission \
+              --function-name ${{ needs.validate.outputs.function_name }} \
+              --statement-id $HEALTH_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/GET/health" || echo "Health permission may already exist"
+          else
+            echo "🔄 Updating existing API Gateway..."
+            # Update integrations with new Lambda ARN
+            MCP_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`mcp`].[id]' --output text | head -1)
+            HEALTH_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`health`].[id]' --output text | head -1)
+            
+            if [ ! -z "$MCP_ID" ]; then
+              aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method POST --type AWS_PROXY --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            fi
+            
+            if [ ! -z "$HEALTH_ID" ]; then
+              aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type AWS_PROXY --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            fi
+            
+            # Redeploy API Gateway
+            aws apigateway create-deployment --rest-api-id $API_ID --stage-name ${{ github.event.inputs.environment }}
+          fi
+          
+          # Store API Gateway info
+          echo "API_GATEWAY_ID=$API_ID" >> $GITHUB_ENV
+          echo "API_GATEWAY_URL=https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+
+  test-deployment:
+    needs: [validate, deploy-api-gateway]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Test Lambda function
+        run: |
+          echo "🧪 Testing Lambda function..."
+          
+          # Create test payload
+          cat > test-payload.json << 'EOF'
+          {
+            "version": "2.0",
+            "routeKey": "POST /mcp",
+            "rawPath": "/mcp",
+            "headers": {"content-type": "application/json"},
+            "requestContext": {
+              "http": {"method": "POST", "path": "/mcp", "protocol": "HTTP/1.1", "sourceIp": "127.0.0.1"},
+              "requestId": "test-request-id", "accountId": "123456789012", "apiId": "test-api-id", "stage": "test"
+            },
+            "body": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {}}",
+            "isBase64Encoded": false
+          }
+          EOF
+          
+          # Test Lambda function
+          if aws lambda invoke \
+            --function-name ${{ needs.validate.outputs.function_name }} \
+            --payload fileb://test-payload.json \
+            response.json; then
+            echo "✅ Lambda function test passed!"
+            cat response.json
+          else
+            echo "❌ Lambda function test failed!"
+            exit 1
+          fi
+          
+          # Clean up
+          rm -f test-payload.json response.json
+
+      - name: Test API Gateway
+        run: |
+          echo "🧪 Testing API Gateway..."
+          
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ needs.validate.outputs.api_gateway_name }}`].[id]' --output text | head -1)
+          HEALTH_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`health`].[id]' --output text | head -1)
+          
+          if [ -z "$HEALTH_ID" ]; then
+            echo "❌ Health endpoint not found"
+            exit 1
+          fi
+          
+          # Test health endpoint
+          if aws apigateway test-invoke-method \
+            --rest-api-id $API_ID \
+            --resource-id $HEALTH_ID \
+            --http-method GET \
+            --headers 'Content-Type=application/json' > health-response.json; then
+            echo "✅ API Gateway health test passed!"
+            cat health-response.json
+          else
+            echo "❌ API Gateway health test failed!"
+            exit 1
+          fi
+          
+          # Clean up
+          rm -f health-response.json
+
+      - name: Output deployment info
+        run: |
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ needs.validate.outputs.api_gateway_name }}`].[id]' --output text | head -1)
+          API_URL="https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ github.event.inputs.environment }}"
+          
+          echo "🎉 Deployment completed successfully!"
+          echo "📋 Deployment Summary:"
+          echo "   Environment: ${{ github.event.inputs.environment }}"
+          echo "   Lambda Function: ${{ needs.validate.outputs.function_name }}"
+          echo "   API Gateway: ${{ needs.validate.outputs.api_gateway_name }}"
+          echo "   MCP Endpoint: $API_URL/mcp"
+          echo "   Health Check: $API_URL/health"
+          echo "   S3 Bucket: ${{ github.event.inputs.s3_bucket }}"

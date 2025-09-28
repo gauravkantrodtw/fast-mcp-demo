@@ -1,0 +1,447 @@
+name: Deploy MCP Server to AWS Lambda
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-central-1
+  FUNCTION_NAME: daap-mcp-server
+  LAMBDA_ARCHITECTURE: x86_64  # Change to arm64 if you want ARM64 Lambda
+  API_GATEWAY_NAME: daap-mcp-server-api
+  
+  # IAM Resources
+  ROLE_NAME: daap-mcp-server-role
+  API_POLICY_NAME: daap-mcp-server-api-policy
+  S3_POLICY_NAME: daap-mcp-server-s3-policy
+  
+  # S3 Configuration
+  S3_BUCKET_NAME: databricks-dev-external-ext-str-raw-data-eu-central-1
+  
+  # API Gateway Configuration
+  API_STAGE_NAME: dev
+  MCP_ENDPOINT_PATH: /mcp
+  MCP_ENDPOINT_PATH_PART: mcp
+  HEALTH_ENDPOINT_PATH: /health
+  HTTP_METHOD: POST
+  AUTHORIZATION_TYPE: AWS_IAM
+  INTEGRATION_TYPE: AWS_PROXY
+  
+  # Lambda Configuration
+  RUNTIME: python3.12
+  MEMORY_SIZE: 1024
+  TIMEOUT: 120
+  HANDLER: lambda_handler.lambda_handler
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create deployment package
+        run: |
+          chmod +x create_deployment_package.sh
+          ./create_deployment_package.sh
+
+      - name: Setup IAM and Lambda
+        run: |
+          # Get AWS account ID
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          # Check if function exists
+          if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
+            echo "🔄 Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --zip-file fileb://mcp-server-deployment.zip
+            echo "✅ Lambda function updated successfully"
+          else
+            echo "🆕 Creating new Lambda function..."
+            
+            # Create IAM role (ignore if already exists)
+            echo "Creating IAM role: ${{ env.ROLE_NAME }}"
+            aws iam create-role \
+              --role-name ${{ env.ROLE_NAME }} \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Principal": {
+                      "Service": "lambda.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                  }
+                ]
+              }' 2>/dev/null && echo "✅ IAM role created successfully" || echo "ℹ️  IAM role already exists, continuing..."
+            
+            # Attach basic execution policy
+            aws iam attach-role-policy \
+              --role-name ${{ env.ROLE_NAME }} \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
+            
+            # Create and attach S3 policy
+            S3_POLICY_ARN=$(aws iam create-policy \
+              --policy-name ${{ env.S3_POLICY_NAME }} \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:ListBucket"],
+                    "Resource": [
+                      "arn:aws:s3:::${{ env.S3_BUCKET_NAME }}",
+                      "arn:aws:s3:::${{ env.S3_BUCKET_NAME }}/*"
+                    ]
+                  }
+                ]
+              }' \
+              --query 'Policy.Arn' \
+              --output text 2>/dev/null)
+            
+            # If S3 policy creation failed, get existing policy ARN
+            if [ -z "$S3_POLICY_ARN" ]; then
+              echo "S3 policy already exists, getting existing policy ARN..."
+              S3_POLICY_ARN=$(aws iam get-policy --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/${{ env.S3_POLICY_NAME }}" --query 'Policy.Arn' --output text 2>/dev/null)
+            fi
+            
+            # Attach S3 policy if we have a valid ARN
+            if [ ! -z "$S3_POLICY_ARN" ]; then
+              aws iam attach-role-policy \
+                --role-name ${{ env.ROLE_NAME }} \
+                --policy-arn $S3_POLICY_ARN || echo "S3 policy may already be attached"
+            else
+              echo "Warning: Could not create or find S3 policy ARN"
+            fi
+            
+            # Wait for role to be ready
+            sleep 10
+            
+            # Get role ARN and create Lambda function
+            echo "Creating Lambda function: ${{ env.FUNCTION_NAME }}"
+            ROLE_ARN=$(aws iam get-role --role-name ${{ env.ROLE_NAME }} --query 'Role.Arn' --output text)
+            
+            aws lambda create-function \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --runtime ${{ env.RUNTIME }} \
+              --role $ROLE_ARN \
+              --handler ${{ env.HANDLER }} \
+              --zip-file fileb://mcp-server-deployment.zip \
+              --architecture ${{ env.LAMBDA_ARCHITECTURE }} \
+              --memory-size ${{ env.MEMORY_SIZE }} \
+              --timeout ${{ env.TIMEOUT }} 2>/dev/null && echo "✅ Lambda function created successfully" || {
+              echo "ℹ️  Lambda function may already exist, checking..."
+              if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
+                echo "🔄 Updating existing Lambda function..."
+                aws lambda update-function-code \
+                  --function-name ${{ env.FUNCTION_NAME }} \
+                  --zip-file fileb://mcp-server-deployment.zip
+                echo "✅ Lambda function updated successfully"
+              else
+                echo "❌ Lambda function creation failed and function doesn't exist"
+                exit 1
+              fi
+            }
+          fi
+
+      - name: Wait for Lambda to be ready
+        run: |
+          echo "Waiting for Lambda function to be ready..."
+          for i in {1..30}; do
+            STATE=$(aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --query 'Configuration.State' --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i: Function state is $STATE"
+            if [ "$STATE" = "Active" ]; then
+              echo "Function is ready!"
+              break
+            elif [ "$STATE" = "Failed" ]; then
+              echo "Function creation failed!"
+              exit 1
+            fi
+            sleep 10
+          done
+          
+          if [ "$STATE" != "Active" ]; then
+            echo "Function did not become active within 5 minutes"
+            exit 1
+          fi
+
+      - name: Test Lambda function
+        run: |
+          # Create test payload
+          cat > test-payload.json << 'EOF'
+          {
+            "version": "2.0",
+            "routeKey": "POST /mcp",
+            "rawPath": "/mcp",
+            "rawQueryString": "",
+            "headers": {
+              "content-type": "application/json",
+              "host": "localhost"
+            },
+            "requestContext": {
+              "http": {
+                "method": "POST",
+                "path": "/mcp",
+                "protocol": "HTTP/1.1",
+                "sourceIp": "127.0.0.1",
+                "userAgent": "test-agent"
+              },
+              "requestId": "test-request-id",
+              "accountId": "123456789012",
+              "apiId": "test-api-id",
+              "stage": "test"
+            },
+            "body": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {}}",
+            "isBase64Encoded": false
+          }
+          EOF
+          
+          # Test with retry logic
+          echo "Testing Lambda function..."
+          for i in {1..5}; do
+            echo "Test attempt $i..."
+            if aws lambda invoke \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --payload fileb://test-payload.json \
+              response.json; then
+              echo "MCP Function response:"
+              cat response.json
+              break
+            else
+              echo "Test failed, retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          
+          # Clean up
+          rm -f test-payload.json response.json
+
+      - name: Setup API Gateway
+        run: |
+          # Get AWS account ID and Lambda ARN
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          LAMBDA_ARN=$(aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --query 'Configuration.FunctionArn' --output text)
+          
+          # Check if API Gateway already exists
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ env.API_GATEWAY_NAME }}`].[id]' --output text | head -1)
+          
+          if [ -z "$API_ID" ]; then
+            echo "Creating new API Gateway..."
+            API_ID=$(aws apigateway create-rest-api --name ${{ env.API_GATEWAY_NAME }} --query 'id' --output text)
+            ROOT_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[0].id' --output text)
+            
+            # Create endpoints
+            MCP_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part ${{ env.MCP_ENDPOINT_PATH_PART }} --query 'id' --output text)
+            HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
+            
+            # Configure methods
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --authorization-type ${{ env.AUTHORIZATION_TYPE }}
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type ${{ env.AUTHORIZATION_TYPE }}
+            
+            # Configure integrations
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            
+            # Deploy API Gateway
+            aws apigateway create-deployment --rest-api-id $API_ID --stage-name ${{ env.API_STAGE_NAME }}
+            
+            # Add Lambda permissions
+            MCP_STATEMENT_ID="apigateway-invoke-$(date +%s)"
+            HEALTH_STATEMENT_ID="apigateway-invoke-health-$(date +%s)"
+            
+            aws lambda add-permission \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --statement-id $MCP_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/${{ env.HTTP_METHOD }}${{ env.MCP_ENDPOINT_PATH }}" || echo "MCP permission may already exist"
+            
+            aws lambda add-permission \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --statement-id $HEALTH_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/GET${{ env.HEALTH_ENDPOINT_PATH }}" || echo "Health permission may already exist"
+            
+            # Create and attach API Gateway IAM policy
+            POLICY_ARN=$(aws iam create-policy \
+              --policy-name ${{ env.API_POLICY_NAME }} \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": "execute-api:Invoke",
+                    "Resource": [
+                      "arn:aws:execute-api:'${{ env.AWS_REGION }}':*:'$API_ID'/*/${{ env.HTTP_METHOD }}${{ env.MCP_ENDPOINT_PATH }}",
+                      "arn:aws:execute-api:'${{ env.AWS_REGION }}':*:'$API_ID'/*/GET${{ env.HEALTH_ENDPOINT_PATH }}"
+                    ]
+                  }
+                ]
+              }' \
+              --query 'Policy.Arn' \
+              --output text 2>/dev/null)
+            
+            if [ -z "$POLICY_ARN" ]; then
+              echo "Policy already exists, getting existing policy ARN..."
+              POLICY_ARN=$(aws iam get-policy --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/${{ env.API_POLICY_NAME }}" --query 'Policy.Arn' --output text 2>/dev/null)
+            fi
+            
+            if [ ! -z "$POLICY_ARN" ]; then
+              aws iam attach-role-policy \
+                --role-name ${{ env.ROLE_NAME }} \
+                --policy-arn $POLICY_ARN || echo "Policy may already be attached"
+            else
+              echo "Warning: Could not create or find policy ARN"
+            fi
+            
+            # Store API Gateway info
+            echo "API_GATEWAY_ID=$API_ID" >> $GITHUB_ENV
+            echo "API_GATEWAY_URL=https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ env.API_STAGE_NAME }}" >> $GITHUB_ENV
+          else
+            echo "Using existing API Gateway: $API_ID"
+            
+            # Update MCP endpoint
+            MCP_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`${{ env.MCP_ENDPOINT_PATH_PART }}`].[id]' --output text | head -1)
+            if [ ! -z "$MCP_ID" ]; then
+              aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+              aws apigateway update-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --patch-ops op=replace,path=/authorizationType,value=${{ env.AUTHORIZATION_TYPE }}
+            fi
+            
+            # Update health endpoint
+            HEALTH_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`health`].[id]' --output text | head -1)
+            ROOT_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[0].id' --output text)
+            
+            if [ -z "$HEALTH_ID" ]; then
+              echo "Creating missing /health endpoint..."
+              HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
+              aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type ${{ env.AUTHORIZATION_TYPE }}
+            fi
+            
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            
+            # Ensure health endpoint has Lambda permission
+            HEALTH_STATEMENT_ID="apigateway-invoke-health-$(date +%s)"
+            aws lambda add-permission \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --statement-id $HEALTH_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/GET${{ env.HEALTH_ENDPOINT_PATH }}" || echo "Health permission may already exist"
+            
+            # Redeploy API Gateway
+            aws apigateway create-deployment --rest-api-id $API_ID --stage-name ${{ env.API_STAGE_NAME }}
+          fi
+          
+          # Wait for deployment to complete
+          sleep 3
+          
+          # Output endpoint URLs
+          API_URL="https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ env.API_STAGE_NAME }}"
+          echo "MCP Endpoint: $API_URL${{ env.MCP_ENDPOINT_PATH }}"
+          echo "Health Check: $API_URL${{ env.HEALTH_ENDPOINT_PATH }}"
+
+      - name: Wait for API Gateway deployment
+        run: |
+          echo "Waiting for API Gateway deployment to complete..."
+          sleep 30
+
+      - name: Test API Gateway
+        run: |
+          # Get API Gateway info
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ env.API_GATEWAY_NAME }}`].[id]' --output text | head -1)
+          API_URL="https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ env.API_STAGE_NAME }}"
+
+          echo "API Gateway URL: $API_URL"
+          echo "MCP Endpoint: $API_URL${{ env.MCP_ENDPOINT_PATH }}"
+          echo "Health Check: $API_URL${{ env.HEALTH_ENDPOINT_PATH }}"
+
+          # Test health endpoint with IAM authentication
+          echo "Testing health endpoint with IAM authentication..."
+          HEALTH_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`health`].[id]' --output text | head -1)
+          
+          if [ -z "$HEALTH_ID" ]; then
+            echo "❌ Health resource not found in API Gateway"
+            exit 1
+          fi
+          
+          echo "Found health resource ID: $HEALTH_ID"
+          
+          # Test using AWS CLI with IAM authentication
+          for i in {1..3}; do
+            echo "Health test attempt $i..."
+            if aws apigateway test-invoke-method \
+              --rest-api-id $API_ID \
+              --resource-id $HEALTH_ID \
+              --http-method GET \
+              --headers 'Content-Type=application/json' > health-response.json; then
+              echo "Health test passed!"
+              cat health-response.json
+              break
+            else
+              echo "Health test attempt $i failed, retrying..."
+              sleep 10
+            fi
+          done
+
+          # Test MCP endpoint
+          echo "Testing MCP endpoint with IAM authentication..."
+          MCP_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`${{ env.MCP_ENDPOINT_PATH_PART }}`].[id]' --output text | head -1)
+          
+          if [ -z "$MCP_ID" ]; then
+            echo "❌ MCP resource not found in API Gateway"
+            exit 1
+          fi
+          
+          echo "Found MCP resource ID: $MCP_ID"
+          
+          # Create test payload
+          cat > test-mcp-payload.json << 'EOF'
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+          }
+          EOF
+          
+          # Test using AWS CLI with IAM authentication
+          for i in {1..3}; do
+            echo "Test attempt $i..."
+            if aws apigateway test-invoke-method \
+              --rest-api-id $API_ID \
+              --resource-id $MCP_ID \
+              --http-method ${{ env.HTTP_METHOD }} \
+              --body file://test-mcp-payload.json \
+              --headers 'Content-Type=application/json' > test-response.json; then
+              echo "MCP test passed!"
+              cat test-response.json
+              break
+            else
+              echo "MCP test attempt $i failed, retrying..."
+              sleep 10
+            fi
+          done
+          
+          # Clean up
+          rm -f test-mcp-payload.json test-response.json health-response.json

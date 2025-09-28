@@ -1,0 +1,162 @@
+name: Cleanup AWS Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deletion:
+        description: 'Type "DELETE" to confirm resource deletion'
+        required: true
+        default: ''
+        type: string
+
+env:
+  AWS_REGION: eu-central-1
+  FUNCTION_NAME: daap-mcp-server
+  API_GATEWAY_NAME: daap-mcp-server-api
+  
+  # IAM Resources
+  ROLE_NAME: daap-mcp-server-role
+  API_POLICY_NAME: daap-mcp-server-api-policy
+  S3_POLICY_NAME: daap-mcp-server-s3-policy
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_deletion }}" != "DELETE" ]; then
+            echo "❌ Deletion not confirmed. Please type 'DELETE' to confirm."
+            exit 1
+          fi
+          echo "✅ Deletion confirmed. Proceeding with cleanup..."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup Lambda Resources
+        run: |
+          # Get AWS account ID once
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          echo "🗑️ Cleaning up Lambda resources..."
+          
+          # Delete Lambda permissions
+          if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
+            echo "Deleting Lambda permissions for: ${{ env.FUNCTION_NAME }}"
+            POLICY=$(aws lambda get-policy --function-name ${{ env.FUNCTION_NAME }} --query 'Policy' --output text 2>/dev/null || echo '{}')
+            if [ "$POLICY" != "{}" ]; then
+              echo "$POLICY" | jq -r '.Statement[] | select(.Principal.Service == "apigateway.amazonaws.com") | .Sid' | while read statement_id; do
+                if [ ! -z "$statement_id" ]; then
+                  echo "Removing permission: $statement_id"
+                  aws lambda remove-permission --function-name ${{ env.FUNCTION_NAME }} --statement-id "$statement_id" || echo "Permission $statement_id not found"
+                fi
+              done
+              echo "✅ Lambda permissions cleaned up"
+            else
+              echo "ℹ️ No Lambda permissions found"
+            fi
+            
+            # Delete Lambda function
+            echo "Deleting Lambda function: ${{ env.FUNCTION_NAME }}"
+            aws lambda delete-function --function-name ${{ env.FUNCTION_NAME }}
+            echo "✅ Lambda function deleted successfully"
+          else
+            echo "ℹ️ Lambda function not found, skipping..."
+          fi
+
+      - name: Cleanup API Gateway
+        run: |
+          echo "🗑️ Cleaning up API Gateway..."
+          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ env.API_GATEWAY_NAME }}`].[id]' --output text | head -1)
+          
+          if [ ! -z "$API_ID" ] && [ "$API_ID" != "None" ]; then
+            aws apigateway delete-rest-api --rest-api-id $API_ID
+            echo "✅ API Gateway deleted successfully (ID: $API_ID)"
+          else
+            echo "ℹ️ API Gateway not found, skipping..."
+          fi
+
+      - name: Cleanup IAM Resources
+        run: |
+          # Get AWS account ID once
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          echo "🗑️ Cleaning up IAM resources..."
+          
+          # Function to delete IAM policy with version cleanup
+          delete_iam_policy() {
+            local policy_name=$1
+            local policy_arn="arn:aws:iam::$ACCOUNT_ID:policy/$policy_name"
+            
+            echo "Deleting IAM policy: $policy_name"
+            if aws iam get-policy --policy-arn $policy_arn >/dev/null 2>&1; then
+              # Delete all policy versions first
+              aws iam list-policy-versions --policy-arn $policy_arn --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text | tr '\t' '\n' | while read version; do
+                if [ ! -z "$version" ]; then
+                  aws iam delete-policy-version --policy-arn $policy_arn --version-id $version || echo "Failed to delete version $version"
+                fi
+              done
+              
+              # Delete the policy
+              aws iam delete-policy --policy-arn $policy_arn
+              echo "✅ IAM policy $policy_name deleted successfully"
+            else
+              echo "ℹ️ IAM policy $policy_name not found, skipping..."
+            fi
+          }
+          
+          # Detach IAM role policies
+          if aws iam get-role --role-name ${{ env.ROLE_NAME }} >/dev/null 2>&1; then
+            echo "Detaching IAM role policies: ${{ env.ROLE_NAME }}"
+            
+            # Detach basic execution role
+            aws iam detach-role-policy \
+              --role-name ${{ env.ROLE_NAME }} \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || echo "Basic execution policy not attached"
+            
+            # Detach custom policies
+            aws iam detach-role-policy \
+              --role-name ${{ env.ROLE_NAME }} \
+              --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/${{ env.S3_POLICY_NAME }} || echo "S3 policy not attached"
+            
+            aws iam detach-role-policy \
+              --role-name ${{ env.ROLE_NAME }} \
+              --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/${{ env.API_POLICY_NAME }} || echo "API Gateway policy not attached"
+            
+            echo "✅ IAM role policies detached"
+            
+            # Delete IAM role
+            echo "Deleting IAM role: ${{ env.ROLE_NAME }}"
+            aws iam delete-role --role-name ${{ env.ROLE_NAME }}
+            echo "✅ IAM role deleted successfully"
+          else
+            echo "ℹ️ IAM role not found, skipping policy detachment..."
+          fi
+          
+          # Delete IAM policies
+          delete_iam_policy "${{ env.API_POLICY_NAME }}"
+          delete_iam_policy "${{ env.S3_POLICY_NAME }}"
+
+      - name: Cleanup Summary
+        run: |
+          echo "🎉 Cleanup completed!"
+          echo "📋 Resources cleaned up:"
+          echo "   - Lambda Function: ${{ env.FUNCTION_NAME }}"
+          echo "   - Lambda Permissions: API Gateway invoke permissions"
+          echo "   - API Gateway: ${{ env.API_GATEWAY_NAME }}"
+          echo "   - IAM Role: ${{ env.ROLE_NAME }}"
+          echo "   - IAM Policy: ${{ env.API_POLICY_NAME }}"
+          echo "   - S3 IAM Policy: ${{ env.S3_POLICY_NAME }}"
+          echo ""
+          echo "💡 To redeploy, run the main deployment workflow or use:"
+          echo "   ./create_deployment_package.sh && aws lambda create-function ..."
