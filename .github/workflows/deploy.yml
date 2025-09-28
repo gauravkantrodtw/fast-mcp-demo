@@ -23,7 +23,7 @@ env:
   MCP_ENDPOINT_PATH_PART: mcp
   HEALTH_ENDPOINT_PATH: /health
   HTTP_METHOD: POST
-  AUTHORIZATION_TYPE: AWS_IAM
+  AUTHORIZATION_TYPE: NONE
   INTEGRATION_TYPE: AWS_PROXY
   
   # Lambda Configuration
@@ -341,8 +341,8 @@ jobs:
             HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
             
             # Configure methods
-            aws apigateway put-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --authorization-type ${{ env.AUTHORIZATION_TYPE }}
-            aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type ${{ env.AUTHORIZATION_TYPE }}
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --authorization-type NONE
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type NONE
             
             # Configure integrations
             aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
@@ -411,8 +411,8 @@ jobs:
             MCP_ID=$(aws apigateway get-resources --rest-api-id $API_ID --query 'items[?pathPart==`${{ env.MCP_ENDPOINT_PATH_PART }}`].[id]' --output text | head -1)
             if [ ! -z "$MCP_ID" ]; then
               aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
-              # Update method authorization (skip if it fails)
-              aws apigateway update-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --patch-operations '[{"op":"replace","path":"/authorizationType","value":"'${{ env.AUTHORIZATION_TYPE }}'"}]' || echo "Method update failed, continuing..."
+              # Update method authorization to NONE
+              aws apigateway update-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --patch-operations '[{"op":"replace","path":"/authorizationType","value":"NONE"}]' || echo "Method update failed, continuing..."
             fi
             
             # Update health endpoint
@@ -422,7 +422,10 @@ jobs:
             if [ -z "$HEALTH_ID" ]; then
               echo "Creating missing /health endpoint..."
               HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
-              aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type ${{ env.AUTHORIZATION_TYPE }}
+              aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type NONE
+            else
+              # Update existing health endpoint to remove auth
+              aws apigateway update-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --patch-operations '[{"op":"replace","path":"/authorizationType","value":"NONE"}]' || echo "Health method update failed, continuing..."
             fi
             
             aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
