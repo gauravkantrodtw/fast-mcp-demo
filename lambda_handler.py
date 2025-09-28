@@ -30,13 +30,34 @@ def lambda_handler(event, context):
     start_time = time.time()
     
     try:
-        # Parse the API Gateway event
+        # Parse the API Gateway event - handle both v1 and v2 formats
+        # Try v2 format first
         http_method = event.get('requestContext', {}).get('http', {}).get('method', '')
         path = event.get('rawPath', '')
+        
+        # If v2 format doesn't work, try v1 format
+        if not http_method:
+            http_method = event.get('httpMethod', '')
+        if not path:
+            path = event.get('path', '')
+        
         headers = event.get('headers', {})
         body = event.get('body', '')
         
+        # Debug logging
+        logger.info(f"Event structure: {json.dumps(event, indent=2)}")
         logger.info(f"Processing {http_method} {path}")
+        logger.info(f"Headers: {headers}")
+        logger.info(f"Body: {body}")
+        
+        # Fallback for missing method or path
+        if not http_method or not path:
+            logger.error(f"Missing method or path: method='{http_method}', path='{path}'")
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": "Bad Request", "message": f"Missing method or path: method='{http_method}', path='{path}'"})
+            }
         
         # Handle health check endpoint
         if path == '/health' and http_method == 'GET':
