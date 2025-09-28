@@ -263,6 +263,10 @@ async def process_mcp_request(request):
                 }
             }
         
+        elif method == 'notifications/initialized':
+            # This is a notification, so no response needed
+            return None
+        
         else:
             return {
                 "jsonrpc": "2.0",
