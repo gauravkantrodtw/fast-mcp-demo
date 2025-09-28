@@ -95,7 +95,19 @@ class MCPProxy:
             )
             
             if response['status_code'] == 200:
-                return json.loads(response['body'])
+                response_body = response['body']
+                
+                # Handle notifications (no response needed)
+                if request.get('method', '').startswith('notifications/'):
+                    # For notifications, don't send any response
+                    return None
+                
+                # Parse JSON response for regular requests
+                if response_body and response_body.strip():
+                    return json.loads(response_body)
+                else:
+                    # Empty response for notifications
+                    return None
             else:
                 return {
                     "jsonrpc": "2.0",
@@ -150,9 +162,10 @@ def main():
             # Handle the request
             response = proxy.handle_mcp_request(request)
             
-            # Send response to stdout
-            print(json.dumps(response))
-            sys.stdout.flush()
+            # Send response to stdout (only if there's a response)
+            if response is not None:
+                print(json.dumps(response))
+                sys.stdout.flush()
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}")
