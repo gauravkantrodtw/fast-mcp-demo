@@ -96,11 +96,17 @@ jobs:
               }' 2>/dev/null && echo "✅ IAM role created successfully" || echo "ℹ️  IAM role already exists, continuing..."
             
             # Attach basic execution policy
-            aws iam attach-role-policy \
+            echo "Attaching basic execution policy..."
+            if aws iam attach-role-policy \
               --role-name ${{ env.ROLE_NAME }} \
-              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole; then
+              echo "✅ Basic execution policy attached successfully"
+            else
+              echo "ℹ️  Basic execution policy may already be attached"
+            fi
             
             # Create and attach S3 policy
+            echo "Creating S3 policy..."
             S3_POLICY_ARN=$(aws iam create-policy \
               --policy-name ${{ env.S3_POLICY_NAME }} \
               --policy-document '{
@@ -123,25 +129,87 @@ jobs:
             if [ -z "$S3_POLICY_ARN" ]; then
               echo "S3 policy already exists, getting existing policy ARN..."
               S3_POLICY_ARN=$(aws iam get-policy --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/${{ env.S3_POLICY_NAME }}" --query 'Policy.Arn' --output text 2>/dev/null)
+              if [ ! -z "$S3_POLICY_ARN" ]; then
+                echo "✅ Found existing S3 policy: $S3_POLICY_ARN"
+              else
+                echo "❌ Failed to create or find S3 policy"
+                exit 1
+              fi
+            else
+              echo "✅ Created new S3 policy: $S3_POLICY_ARN"
             fi
             
             # Attach S3 policy if we have a valid ARN
             if [ ! -z "$S3_POLICY_ARN" ]; then
-              aws iam attach-role-policy \
+              echo "Attaching S3 policy to role..."
+              if aws iam attach-role-policy \
                 --role-name ${{ env.ROLE_NAME }} \
-                --policy-arn $S3_POLICY_ARN || echo "S3 policy may already be attached"
+                --policy-arn $S3_POLICY_ARN; then
+                echo "✅ S3 policy attached successfully"
+              else
+                echo "ℹ️  S3 policy may already be attached"
+              fi
             else
-              echo "Warning: Could not create or find S3 policy ARN"
+              echo "❌ No valid S3 policy ARN to attach"
+              exit 1
             fi
             
             # Wait for role to be ready
+            echo "Waiting for IAM role to be ready..."
             sleep 10
             
-            # Get role ARN and create Lambda function
-            echo "Creating Lambda function: ${{ env.FUNCTION_NAME }}"
-            ROLE_ARN=$(aws iam get-role --role-name ${{ env.ROLE_NAME }} --query 'Role.Arn' --output text)
+            # Verify the deployment package exists and is valid
+            echo "Verifying deployment package..."
+            if [ ! -f "mcp-server-deployment.zip" ]; then
+              echo "❌ Deployment package not found!"
+              exit 1
+            fi
             
-            aws lambda create-function \
+            # Check if the zip file is valid
+            if ! unzip -t mcp-server-deployment.zip >/dev/null 2>&1; then
+              echo "❌ Deployment package is corrupted!"
+              exit 1
+            fi
+            echo "✅ Deployment package is valid"
+            
+            # Verify IAM role has the necessary permissions
+            echo "Verifying IAM role permissions..."
+            aws iam list-attached-role-policies --role-name ${{ env.ROLE_NAME }} --output table
+            
+            # Check if Lambda function exists in any state
+            echo "Checking for existing Lambda function..."
+            if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
+              echo "ℹ️  Lambda function already exists, getting details..."
+              aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --query 'Configuration.{FunctionName:FunctionName,State:State,LastUpdateStatus:LastUpdateStatus}' --output table
+              
+              # If function exists, update it instead of creating
+              echo "Updating existing Lambda function..."
+              if aws lambda update-function-code \
+                --function-name ${{ env.FUNCTION_NAME }} \
+                --zip-file fileb://mcp-server-deployment.zip; then
+                echo "✅ Lambda function updated successfully"
+                exit 0
+              else
+                echo "❌ Failed to update Lambda function"
+                exit 1
+              fi
+            fi
+            
+            # Get role ARN and create Lambda function
+            echo "Getting IAM role ARN..."
+            ROLE_ARN=$(aws iam get-role --role-name ${{ env.ROLE_NAME }} --query 'Role.Arn' --output text)
+            if [ -z "$ROLE_ARN" ]; then
+              echo "❌ Failed to get IAM role ARN"
+              exit 1
+            fi
+            echo "✅ IAM Role ARN: $ROLE_ARN"
+            
+            echo "Creating Lambda function: ${{ env.FUNCTION_NAME }}"
+            echo "Using role ARN: $ROLE_ARN"
+            echo "Deployment package size: $(ls -lh mcp-server-deployment.zip | awk '{print $5}')"
+            
+            # Try to create the Lambda function with detailed error output
+            if aws lambda create-function \
               --function-name ${{ env.FUNCTION_NAME }} \
               --runtime ${{ env.RUNTIME }} \
               --role $ROLE_ARN \
@@ -149,19 +217,37 @@ jobs:
               --zip-file fileb://mcp-server-deployment.zip \
               --architecture ${{ env.LAMBDA_ARCHITECTURE }} \
               --memory-size ${{ env.MEMORY_SIZE }} \
-              --timeout ${{ env.TIMEOUT }} 2>/dev/null && echo "✅ Lambda function created successfully" || {
-              echo "ℹ️  Lambda function may already exist, checking..."
-              if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
-                echo "🔄 Updating existing Lambda function..."
-                aws lambda update-function-code \
+              --timeout ${{ env.TIMEOUT }} 2>&1; then
+              echo "✅ Lambda function created successfully"
+            else
+              echo "❌ Lambda function creation failed, checking if it exists..."
+              
+              # Check if function exists with more detailed output
+              if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} 2>&1; then
+                echo "🔄 Lambda function exists, updating code..."
+                if aws lambda update-function-code \
                   --function-name ${{ env.FUNCTION_NAME }} \
-                  --zip-file fileb://mcp-server-deployment.zip
-                echo "✅ Lambda function updated successfully"
+                  --zip-file fileb://mcp-server-deployment.zip 2>&1; then
+                  echo "✅ Lambda function updated successfully"
+                else
+                  echo "❌ Failed to update Lambda function"
+                  exit 1
+                fi
               else
                 echo "❌ Lambda function creation failed and function doesn't exist"
+                echo "Checking AWS CLI error details..."
+                aws lambda create-function \
+                  --function-name ${{ env.FUNCTION_NAME }} \
+                  --runtime ${{ env.RUNTIME }} \
+                  --role $ROLE_ARN \
+                  --handler ${{ env.HANDLER }} \
+                  --zip-file fileb://mcp-server-deployment.zip \
+                  --architecture ${{ env.LAMBDA_ARCHITECTURE }} \
+                  --memory-size ${{ env.MEMORY_SIZE }} \
+                  --timeout ${{ env.TIMEOUT }} || true
                 exit 1
               fi
-            }
+            fi
           fi
 
       - name: Wait for Lambda to be ready
