@@ -73,12 +73,12 @@ jobs:
       - name: Upload Lambda layer to AWS
         run: |
           # Upload dependencies layer
-          if [ -f "daap-mcp-server-dependencies.zip" ]; then
+          if [ -f "lambda-layers/daap-mcp-server-dependencies.zip" ]; then
             echo "Uploading dependencies layer..."
             DEPENDENCIES_LAYER_ARN=$(aws lambda publish-layer-version \
               --layer-name daap-mcp-server-dependencies \
               --description "All project dependencies from pyproject.toml" \
-              --zip-file fileb://daap-mcp-server-dependencies.zip \
+              --zip-file fileb://lambda-layers/daap-mcp-server-dependencies.zip \
               --compatible-runtimes python3.12 \
               --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
               --query 'LayerVersionArn' \
@@ -93,7 +93,7 @@ jobs:
           
           # Get layer sizes for reporting
           echo "📊 Package sizes:"
-          ls -lh *.zip | grep -E "(daap-mcp-server|mcp-server-minimal)" || echo "No layer files found"
+          ls -lh lambda-layers/*.zip | grep -E "(daap-mcp-server|mcp-server-minimal)" || echo "No layer files found"
 
       - name: Create minimal deployment package
         run: |
