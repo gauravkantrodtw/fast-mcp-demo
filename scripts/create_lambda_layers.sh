@@ -60,7 +60,7 @@ create_layer() {
     
     # Install dependencies using uv for Lambda layer compatibility
     echo "Installing dependencies for $layer_name..."
-    uv pip install -r $requirements_file --target $layer_dir/python --no-deps --upgrade
+    uv pip install -r $requirements_file --target $layer_dir/python --upgrade
     
     # Create layer zip
     cd $layer_dir
