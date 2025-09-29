@@ -235,13 +235,24 @@ async def process_mcp_request(request):
                 }
             except Exception as e:
                 logger.error(f"Tool execution error: {str(e)}", exc_info=True)
+                
+                # Extract detailed error message from ToolExecutionError
+                if hasattr(e, 'args') and e.args and isinstance(e.args[0], str):
+                    error_message = e.args[0]
+                else:
+                    error_message = str(e)
+                
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "error": {
                         "code": -32603,
-                        "message": "Internal error",
-                        "data": f"Tool execution failed: {str(e)}"
+                        "message": error_message,  # Use detailed error message instead of generic
+                        "data": {
+                            "tool": tool_name,
+                            "error_type": type(e).__name__,
+                            "details": str(e)
+                        }
                     }
                 }
         
@@ -363,13 +374,20 @@ async def process_mcp_request(request):
     
     except Exception as e:
         logger.error(f"MCP processing error: {str(e)}", exc_info=True)
+        
+        # Extract detailed error message
+        error_message = str(e) if str(e) else "Internal error"
+        
         return {
             "jsonrpc": "2.0",
             "id": request.get('id'),
             "error": {
                 "code": -32603,
-                "message": "Internal error",
-                "data": str(e)
+                "message": error_message,  # Use detailed error message
+                "data": {
+                    "error_type": type(e).__name__,
+                    "details": str(e)
+                }
             }
         }
 

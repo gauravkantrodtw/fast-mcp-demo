@@ -1,6 +1,7 @@
 from utils.s3_csv_processor import read_s3_csv_chunk, get_basic_info, format_basic_report
 from utils.logger import get_logger, log_success, log_error
 from utils.error_handler import handle_errors, ToolExecutionError
+import os
 
 logger = get_logger(__name__)
 
@@ -23,6 +24,10 @@ def analyze_s3_csv(bucket_name: str, file_key: str) -> str:
     file_path = f"s3://{bucket_name}/{file_key}"
     logger.info(f"Getting basic info from S3 CSV: {file_path}")
 
+    # Pre-flight checks
+    aws_region = os.getenv("AWS_REGION", "eu-central-1")
+    logger.info(f"Using AWS region: {aws_region}")
+
     try:
         df_chunk = read_s3_csv_chunk(bucket_name, file_key, chunk_size=1000)
         info = get_basic_info(df_chunk)
@@ -34,7 +39,39 @@ def analyze_s3_csv(bucket_name: str, file_key: str) -> str:
                    rows=info['total_rows'], columns=info['total_columns'])
         return report
 
+    except ValueError as e:
+        # Input validation errors
+        error_msg = f"❌ Invalid input parameters: {str(e)}"
+        logger.error(error_msg)
+        raise ToolExecutionError(error_msg) from e
+        
+    except PermissionError as e:
+        # AWS credentials/permissions errors
+        error_msg = f"❌ AWS Authentication/Permission Error:\n{str(e)}"
+        logger.error(error_msg)
+        raise ToolExecutionError(error_msg) from e
+        
+    except ConnectionError as e:
+        # AWS S3 specific errors (bucket not found, access denied, etc.)
+        error_msg = f"❌ AWS S3 Error:\n{str(e)}"
+        logger.error(error_msg)
+        raise ToolExecutionError(error_msg) from e
+        
+    except FileNotFoundError as e:
+        # File not found errors
+        error_msg = f"❌ File Not Found:\n{str(e)}"
+        logger.error(error_msg)
+        raise ToolExecutionError(error_msg) from e
+        
     except Exception as e:
+        # Catch-all for unexpected errors
+        error_msg = (
+            f"❌ Unexpected error analyzing S3 CSV file:\n"
+            f"   • File: {file_path}\n"
+            f"   • AWS Region: {aws_region}\n"
+            f"   • Error: {str(e)}\n"
+            f"   • Please check the file format and try again"
+        )
         log_error(logger, f"S3 CSV processing failed", e, 
                  bucket=bucket_name, file_key=file_key)
-        raise ToolExecutionError(f"Failed to process S3 CSV {file_path}: {e}") from e
+        raise ToolExecutionError(error_msg) from e
