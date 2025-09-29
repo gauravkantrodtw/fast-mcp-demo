@@ -104,6 +104,7 @@ mkdir -p lambda-function-code
 [ -f "server.py" ] && cp server.py lambda-function-code/
 [ -d "tools" ] && cp -r tools lambda-function-code/
 [ -d "utils" ] && cp -r utils lambda-function-code/
+[ -d "data" ] && cp -r data lambda-function-code/
 
 # Create a simple requirements.txt for the function code
 cat > lambda-function-code/requirements.txt << 'EOF'
