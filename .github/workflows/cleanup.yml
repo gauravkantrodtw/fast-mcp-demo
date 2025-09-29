@@ -50,6 +50,32 @@ jobs:
           
           echo "🗑️ Cleaning up Lambda resources..."
           
+          # Delete Lambda layers
+          echo "Deleting Lambda layers..."
+          LAYER_NAMES=("daap-mcp-server-fastmcp-urllib3" "daap-mcp-server-pandas")
+          
+          for layer_name in "${LAYER_NAMES[@]}"; do
+            echo "Checking for layer: $layer_name"
+            if aws lambda list-layers --query "Layers[?LayerName=='$layer_name'].LayerName" --output text | grep -q "$layer_name"; then
+              echo "Deleting layer: $layer_name"
+              # Get all versions of the layer
+              VERSIONS=$(aws lambda list-layer-versions --layer-name "$layer_name" --query 'LayerVersions[].Version' --output text)
+              if [ ! -z "$VERSIONS" ]; then
+                echo "$VERSIONS" | tr '\t' '\n' | while read version; do
+                  if [ ! -z "$version" ]; then
+                    echo "Deleting layer version: $layer_name:$version"
+                    aws lambda delete-layer-version --layer-name "$layer_name" --version-number "$version" || echo "Failed to delete version $version"
+                  fi
+                done
+                echo "✅ Layer $layer_name deleted successfully"
+              else
+                echo "ℹ️ No versions found for layer $layer_name"
+              fi
+            else
+              echo "ℹ️ Layer $layer_name not found, skipping..."
+            fi
+          done
+          
           # Delete Lambda permissions
           if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
             echo "Deleting Lambda permissions for: ${{ env.FUNCTION_NAME }}"
@@ -152,6 +178,7 @@ jobs:
           echo "🎉 Cleanup completed!"
           echo "📋 Resources cleaned up:"
           echo "   - Lambda Function: ${{ env.FUNCTION_NAME }}"
+          echo "   - Lambda Layers: daap-mcp-server-fastmcp-urllib3, daap-mcp-server-pandas"
           echo "   - Lambda Permissions: API Gateway invoke permissions"
           echo "   - API Gateway: ${{ env.API_GATEWAY_NAME }}"
           echo "   - IAM Role: ${{ env.ROLE_NAME }}"

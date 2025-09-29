@@ -130,6 +130,41 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Cleanup Lambda layers
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "🗑️ Cleaning up Lambda layers..."
+          LAYER_NAMES=("daap-mcp-server-fastmcp-urllib3" "daap-mcp-server-pandas")
+          
+          for layer_name in "${LAYER_NAMES[@]}"; do
+            echo "Checking for layer: $layer_name"
+            if aws lambda list-layers --query "Layers[?LayerName=='$layer_name'].LayerName" --output text | grep -q "$layer_name"; then
+              echo "Deleting layer: $layer_name"
+              # Get all versions of the layer
+              VERSIONS=$(aws lambda list-layer-versions --layer-name "$layer_name" --query 'LayerVersions[].Version' --output text)
+              if [ ! -z "$VERSIONS" ]; then
+                echo "$VERSIONS" | tr '\t' '\n' | while read version; do
+                  if [ ! -z "$version" ]; then
+                    echo "Deleting layer version: $layer_name:$version"
+                    aws lambda delete-layer-version --layer-name "$layer_name" --version-number "$version" || echo "Failed to delete version $version"
+                  fi
+                done
+                echo "✅ Layer $layer_name deleted successfully"
+              else
+                echo "ℹ️ No versions found for layer $layer_name"
+              fi
+            else
+              echo "ℹ️ Layer $layer_name not found, skipping..."
+            fi
+          done
+
+      - name: Dry run - Lambda layers cleanup
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔍 DRY RUN: Would delete Lambda layers:"
+          echo "   - daap-mcp-server-fastmcp-urllib3 (all versions)"
+          echo "   - daap-mcp-server-pandas (all versions)"
+
       - name: Cleanup Lambda permissions
         if: github.event.inputs.dry_run != 'true'
         run: |
@@ -161,6 +196,7 @@ jobs:
         if: github.event.inputs.dry_run == 'true'
         run: |
           echo "🔍 DRY RUN: Would delete Lambda function: ${{ needs.validate.outputs.function_name }}"
+          echo "🔍 DRY RUN: Would delete Lambda layers: daap-mcp-server-fastmcp-urllib3, daap-mcp-server-pandas"
           echo "🔍 DRY RUN: Would remove all API Gateway invoke permissions"
 
   cleanup-api-gateway:
@@ -289,6 +325,7 @@ jobs:
           
           if [ "${{ needs.discover-resources.outputs.lambda_exists }}" == "true" ]; then
             echo "   ✅ Lambda Function: ${{ needs.validate.outputs.function_name }}"
+            echo "   ✅ Lambda Layers: daap-mcp-server-fastmcp-urllib3, daap-mcp-server-pandas"
             echo "   ✅ Lambda Permissions: API Gateway invoke permissions"
           else
             echo "   ℹ️ Lambda Function: Not found (skipped)"
