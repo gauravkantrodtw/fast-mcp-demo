@@ -60,6 +60,8 @@ jobs:
 
       - name: Create Lambda layers
         run: |
+          # Ensure Python 3.12 is used for layer creation
+          python --version
           chmod +x scripts/create_lambda_layers.sh
           ./scripts/create_lambda_layers.sh
 
@@ -119,7 +121,7 @@ jobs:
           
           # Get layer sizes for reporting
           echo "📊 Package sizes:"
-          ls -lh lambda-layers/*.zip | grep -E "(daap-mcp-server|mcp-server-minimal)" || echo "No layer files found"
+          ls -lh lambda-layers/*.zip | grep -E "(daap-mcp-server|mcp-lambda-function)" || echo "No layer files found"
 
       - name: Create minimal deployment package
         run: |
@@ -140,12 +142,19 @@ jobs:
               --zip-file fileb://mcp-server-deployment.zip
             echo "✅ Lambda function code updated successfully"
             
-            # Update layers
+            # Update layers with retry logic
             echo "Updating Lambda function layers..."
-            aws lambda update-function-configuration \
-              --function-name ${{ env.FUNCTION_NAME }} \
-              --layers $LAYER_ARNS
-            echo "✅ Lambda function layers updated successfully"
+            for i in {1..3}; do
+              if aws lambda update-function-configuration \
+                --function-name ${{ env.FUNCTION_NAME }} \
+                --layers $LAYER_ARNS; then
+                echo "✅ Lambda function layers updated successfully"
+                break
+              else
+                echo "⚠️  Attempt $i failed, waiting 10 seconds before retry..."
+                sleep 10
+              fi
+            done
           else
             echo "🆕 Creating new Lambda function..."
             
