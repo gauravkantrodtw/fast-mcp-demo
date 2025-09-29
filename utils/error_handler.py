@@ -39,11 +39,11 @@ def handle_errors(
                 # Log error with context
                 context = {
                     'function': func.__name__,
-                    'args': str(args)[:100] + '...' if len(str(args)) > 100 else str(args),
-                    'kwargs': str(kwargs)[:100] + '...' if len(str(kwargs)) > 100 else str(kwargs)
+                    'func_args': str(args)[:100] + '...' if len(str(args)) > 100 else str(args),
+                    'func_kwargs': str(kwargs)[:100] + '...' if len(str(kwargs)) > 100 else str(kwargs)
                 }
                 
-                logger.log(log_level, f"❌ {operation} failed", extra=context, exc_info=True)
+                logger.log(log_level, f"❌ {operation} failed - function: {context['function']}, args: {context['func_args']}, kwargs: {context['func_kwargs']}", exc_info=True)
                 
                 if reraise:
                     raise
