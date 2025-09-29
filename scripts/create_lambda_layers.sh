@@ -27,7 +27,19 @@ echo "📦 Extracting dependencies from pyproject.toml..."
 echo "📦 Generating requirements.txt from pyproject.toml..."
 uv export --format requirements-txt > $REQUIREMENTS_DIR/requirements.txt
 
-echo "✅ Requirements extracted from pyproject.toml"
+# Split dependencies into multiple layers to stay under 50MB limit
+echo "📦 Splitting dependencies into multiple layers..."
+
+# Layer 1: Core MCP dependencies (fastmcp, urllib3)
+echo "fastmcp==2.12.4" > $REQUIREMENTS_DIR/layer1-core.txt
+echo "urllib3==2.5.0" >> $REQUIREMENTS_DIR/layer1-core.txt
+
+# Layer 2: Data processing dependencies (pandas)
+echo "pandas==2.3.2" > $REQUIREMENTS_DIR/layer2-data.txt
+
+# Note: boto3 is pre-installed in AWS Lambda, so we don't need to include it
+
+echo "✅ Requirements split into multiple layers"
 
 # Function to create a layer
 create_layer() {
@@ -60,9 +72,16 @@ create_layer() {
     echo "✅ Created $layer_name.zip (Size: $layer_size)"
 }
 
-# Create single layer with all dependencies
-echo "📦 Creating dependencies layer..."
-create_layer "${LAYER_NAME_PREFIX}-dependencies" "$REQUIREMENTS_DIR/requirements.txt" "$LAYER_DIR/dependencies"
+# Create multiple layers to stay under 50MB limit
+echo "📦 Creating multiple layers..."
+
+# Layer 1: Core MCP dependencies
+echo "📦 Creating Layer 1: Core MCP dependencies..."
+create_layer "${LAYER_NAME_PREFIX}-core" "$REQUIREMENTS_DIR/layer1-core.txt" "$LAYER_DIR/core"
+
+# Layer 2: Data processing dependencies
+echo "📦 Creating Layer 2: Data processing dependencies..."
+create_layer "${LAYER_NAME_PREFIX}-data" "$REQUIREMENTS_DIR/layer2-data.txt" "$LAYER_DIR/data"
 
 # Create minimal deployment package (only application code)
 echo "📦 Creating minimal deployment package..."
@@ -90,12 +109,14 @@ for layer_zip in *.zip; do
     echo "  $layer_zip: $size"
 done
 
-echo "✅ Lambda layer created successfully!"
+echo "✅ Lambda layers created successfully!"
 echo ""
 echo "📋 Next steps:"
-echo "1. Upload layer to AWS Lambda"
-echo "2. Update Lambda function to use this layer"
+echo "1. Upload all layers to AWS Lambda"
+echo "2. Update Lambda function to use all layers"
 echo "3. Deploy minimal package as function code"
 echo ""
-echo "🔧 Layer ARN will be needed for Lambda function configuration:"
-echo "   - Dependencies Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-dependencies:1"
+echo "🔧 Layer ARNs will be needed for Lambda function configuration:"
+echo "   - Core Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-core:1"
+echo "   - Data Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-data:1"
+echo "   - Note: boto3 is pre-installed in AWS Lambda, so no layer needed"

@@ -70,26 +70,48 @@ jobs:
           echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
           echo "✅ AWS Account ID: $ACCOUNT_ID"
 
-      - name: Upload Lambda layer to AWS
+      - name: Upload Lambda layers to AWS
         run: |
-          # Upload dependencies layer
-          if [ -f "lambda-layers/daap-mcp-server-dependencies.zip" ]; then
-            echo "Uploading dependencies layer..."
-            DEPENDENCIES_LAYER_ARN=$(aws lambda publish-layer-version \
-              --layer-name daap-mcp-server-dependencies \
-              --description "All project dependencies from pyproject.toml" \
-              --zip-file fileb://lambda-layers/daap-mcp-server-dependencies.zip \
+          # Upload Core layer
+          if [ -f "lambda-layers/daap-mcp-server-core.zip" ]; then
+            echo "Uploading Core layer..."
+            CORE_LAYER_ARN=$(aws lambda publish-layer-version \
+              --layer-name daap-mcp-server-core \
+              --description "Core MCP dependencies (fastmcp==2.12.4, urllib3==2.5.0)" \
+              --zip-file fileb://lambda-layers/daap-mcp-server-core.zip \
               --compatible-runtimes python3.12 \
               --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
               --query 'LayerVersionArn' \
               --output text)
-            echo "DEPENDENCIES_LAYER_ARN=$DEPENDENCIES_LAYER_ARN" >> $GITHUB_ENV
-            echo "LAYER_ARNS=$DEPENDENCIES_LAYER_ARN" >> $GITHUB_ENV
-            echo "✅ Dependencies layer uploaded: $DEPENDENCIES_LAYER_ARN"
+            echo "CORE_LAYER_ARN=$CORE_LAYER_ARN" >> $GITHUB_ENV
+            echo "✅ Core layer uploaded: $CORE_LAYER_ARN"
           else
-            echo "❌ Dependencies layer not found!"
+            echo "❌ Core layer not found!"
             exit 1
           fi
+          
+          # Upload Data layer
+          if [ -f "lambda-layers/daap-mcp-server-data.zip" ]; then
+            echo "Uploading Data layer..."
+            DATA_LAYER_ARN=$(aws lambda publish-layer-version \
+              --layer-name daap-mcp-server-data \
+              --description "Data processing dependencies (pandas==2.3.2)" \
+              --zip-file fileb://lambda-layers/daap-mcp-server-data.zip \
+              --compatible-runtimes python3.12 \
+              --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
+              --query 'LayerVersionArn' \
+              --output text)
+            echo "DATA_LAYER_ARN=$DATA_LAYER_ARN" >> $GITHUB_ENV
+            echo "✅ Data layer uploaded: $DATA_LAYER_ARN"
+          else
+            echo "❌ Data layer not found!"
+            exit 1
+          fi
+          
+          # Combine layer ARNs (boto3 is pre-installed in Lambda)
+          LAYER_ARNS="$CORE_LAYER_ARN $DATA_LAYER_ARN"
+          echo "LAYER_ARNS=$LAYER_ARNS" >> $GITHUB_ENV
+          echo "ℹ️ Note: boto3 is pre-installed in AWS Lambda, so no layer needed"
           
           # Get layer sizes for reporting
           echo "📊 Package sizes:"
