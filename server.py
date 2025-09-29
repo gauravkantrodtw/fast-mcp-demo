@@ -13,15 +13,15 @@ logger = get_logger(__name__)
 mcp = FastMCP("daap-mcp-server")
 
 # Import tools so they get registered via decorators
-# This follows the pattern from the Medium blog post
 import tools
 
 
-# Health check endpoint
+# Health check endpoint - using FastAPI Response
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     """Health check endpoint for monitoring."""
-    return {"status": "healthy", "service": "daap-mcp-server"}
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "healthy", "service": "daap-mcp-server"})
 
 # Add resource support (FastMCP standard)
 @mcp.resource("system://status")
