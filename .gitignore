@@ -4,3 +4,32 @@ mcp-server-deployment.zip
 requirements.txt
 .idea/
 .env
+
+# Lambda layer build artifacts
+lambda-layers/
+layer-requirements/
+daap-mcp-server-*.zip
+mcp-server-minimal.zip
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp

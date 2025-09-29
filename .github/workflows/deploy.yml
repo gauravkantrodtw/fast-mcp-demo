@@ -58,15 +58,53 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Create deployment package
+      - name: Create Lambda layers
         run: |
-          chmod +x create_deployment_package.sh
-          ./create_deployment_package.sh
+          chmod +x scripts/create_lambda_layers.sh
+          ./scripts/create_lambda_layers.sh
+
+      - name: Get AWS account ID
+        run: |
+          # Get AWS account ID once and store it for reuse
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+          echo "✅ AWS Account ID: $ACCOUNT_ID"
+
+      - name: Upload Lambda layer to AWS
+        run: |
+          # Upload dependencies layer
+          if [ -f "daap-mcp-server-dependencies.zip" ]; then
+            echo "Uploading dependencies layer..."
+            DEPENDENCIES_LAYER_ARN=$(aws lambda publish-layer-version \
+              --layer-name daap-mcp-server-dependencies \
+              --description "All project dependencies from pyproject.toml" \
+              --zip-file fileb://daap-mcp-server-dependencies.zip \
+              --compatible-runtimes python3.12 \
+              --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
+              --query 'LayerVersionArn' \
+              --output text)
+            echo "DEPENDENCIES_LAYER_ARN=$DEPENDENCIES_LAYER_ARN" >> $GITHUB_ENV
+            echo "LAYER_ARNS=$DEPENDENCIES_LAYER_ARN" >> $GITHUB_ENV
+            echo "✅ Dependencies layer uploaded: $DEPENDENCIES_LAYER_ARN"
+          else
+            echo "❌ Dependencies layer not found!"
+            exit 1
+          fi
+          
+          # Get layer sizes for reporting
+          echo "📊 Package sizes:"
+          ls -lh *.zip | grep -E "(daap-mcp-server|mcp-server-minimal)" || echo "No layer files found"
+
+      - name: Create minimal deployment package
+        run: |
+          # Use the minimal package created by layers script
+          cp lambda-layers/mcp-server-minimal.zip mcp-server-deployment.zip
+          echo "✅ Using minimal deployment package with layers"
 
       - name: Setup IAM and Lambda
         run: |
-          # Get AWS account ID
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          # Use AWS account ID from previous step
+          echo "Using AWS Account ID: $ACCOUNT_ID"
           
           # Check if function exists
           if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} >/dev/null 2>&1; then
@@ -74,7 +112,14 @@ jobs:
             aws lambda update-function-code \
               --function-name ${{ env.FUNCTION_NAME }} \
               --zip-file fileb://mcp-server-deployment.zip
-            echo "✅ Lambda function updated successfully"
+            echo "✅ Lambda function code updated successfully"
+            
+            # Update layers
+            echo "Updating Lambda function layers..."
+            aws lambda update-function-configuration \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --layers $LAYER_ARNS
+            echo "✅ Lambda function layers updated successfully"
           else
             echo "🆕 Creating new Lambda function..."
             
@@ -187,7 +232,14 @@ jobs:
               if aws lambda update-function-code \
                 --function-name ${{ env.FUNCTION_NAME }} \
                 --zip-file fileb://mcp-server-deployment.zip; then
-                echo "✅ Lambda function updated successfully"
+                echo "✅ Lambda function code updated successfully"
+                
+                # Update layers
+                echo "Updating Lambda function layers..."
+                aws lambda update-function-configuration \
+                  --function-name ${{ env.FUNCTION_NAME }} \
+                  --layers $LAYER_ARNS
+                echo "✅ Lambda function layers updated successfully"
                 exit 0
               else
                 echo "❌ Failed to update Lambda function"
@@ -208,13 +260,14 @@ jobs:
             echo "Using role ARN: $ROLE_ARN"
             echo "Deployment package size: $(ls -lh mcp-server-deployment.zip | awk '{print $5}')"
             
-            # Try to create the Lambda function with detailed error output
+            # Try to create the Lambda function with layers
             if aws lambda create-function \
               --function-name ${{ env.FUNCTION_NAME }} \
               --runtime ${{ env.RUNTIME }} \
               --role $ROLE_ARN \
               --handler ${{ env.HANDLER }} \
               --zip-file fileb://mcp-server-deployment.zip \
+              --layers $LAYER_ARNS \
               --architecture ${{ env.LAMBDA_ARCHITECTURE }} \
               --memory-size ${{ env.MEMORY_SIZE }} \
               --timeout ${{ env.TIMEOUT }} 2>&1; then
@@ -228,7 +281,14 @@ jobs:
                 if aws lambda update-function-code \
                   --function-name ${{ env.FUNCTION_NAME }} \
                   --zip-file fileb://mcp-server-deployment.zip 2>&1; then
-                  echo "✅ Lambda function updated successfully"
+                  echo "✅ Lambda function code updated successfully"
+                  
+                  # Update layers
+                  echo "Updating Lambda function layers..."
+                  aws lambda update-function-configuration \
+                    --function-name ${{ env.FUNCTION_NAME }} \
+                    --layers $LAYER_ARNS
+                  echo "✅ Lambda function layers updated successfully"
                 else
                   echo "❌ Failed to update Lambda function"
                   exit 1
@@ -322,14 +382,22 @@ jobs:
           # Clean up
           rm -f test-payload.json response.json
 
+      - name: Get Lambda ARN
+        run: |
+          # Get Lambda ARN once and store it for reuse
+          LAMBDA_ARN=$(aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --query 'Configuration.FunctionArn' --output text)
+          echo "LAMBDA_ARN=$LAMBDA_ARN" >> $GITHUB_ENV
+          echo "✅ Lambda ARN: $LAMBDA_ARN"
+
       - name: Setup API Gateway
         run: |
-          # Get AWS account ID and Lambda ARN
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          LAMBDA_ARN=$(aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --query 'Configuration.FunctionArn' --output text)
+          # Use AWS account ID and Lambda ARN from previous steps
+          echo "Using AWS Account ID: $ACCOUNT_ID"
+          echo "Using Lambda ARN: $LAMBDA_ARN"
           
-          # Check if API Gateway already exists
+          # Check if API Gateway already exists and store ID
           API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ env.API_GATEWAY_NAME }}`].[id]' --output text | head -1)
+          echo "API_ID=$API_ID" >> $GITHUB_ENV
           
           if [ -z "$API_ID" ]; then
             echo "Creating new API Gateway..."
@@ -458,8 +526,8 @@ jobs:
 
       - name: Test API Gateway
         run: |
-          # Get API Gateway info
-          API_ID=$(aws apigateway get-rest-apis --query 'items[?name==`${{ env.API_GATEWAY_NAME }}`].[id]' --output text | head -1)
+          # Use API Gateway ID from previous step
+          echo "Using API Gateway ID: $API_ID"
           API_URL="https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/${{ env.API_STAGE_NAME }}"
 
           echo "API Gateway URL: $API_URL"
