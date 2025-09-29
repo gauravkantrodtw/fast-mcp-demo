@@ -73,12 +73,12 @@ jobs:
       - name: Upload Lambda layers to AWS
         run: |
           # Upload Core layer
-          if [ -f "lambda-layers/daap-mcp-server-core.zip" ]; then
+          if [ -f "lambda-layers/daap-mcp-server-fastmcp-urllib3.zip" ]; then
             echo "Uploading Core layer..."
             CORE_LAYER_ARN=$(aws lambda publish-layer-version \
-              --layer-name daap-mcp-server-core \
+              --layer-name daap-mcp-server-fastmcp-urllib3 \
               --description "Core MCP dependencies (fastmcp==2.12.4, urllib3==2.5.0)" \
-              --zip-file fileb://lambda-layers/daap-mcp-server-core.zip \
+              --zip-file fileb://lambda-layers/daap-mcp-server-fastmcp-urllib3.zip \
               --compatible-runtimes python3.12 \
               --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
               --query 'LayerVersionArn' \
@@ -91,12 +91,12 @@ jobs:
           fi
           
           # Upload Data layer
-          if [ -f "lambda-layers/daap-mcp-server-data.zip" ]; then
+          if [ -f "lambda-layers/daap-mcp-server-pandas.zip" ]; then
             echo "Uploading Data layer..."
             DATA_LAYER_ARN=$(aws lambda publish-layer-version \
-              --layer-name daap-mcp-server-data \
+              --layer-name daap-mcp-server-pandas \
               --description "Data processing dependencies (pandas==2.3.2)" \
-              --zip-file fileb://lambda-layers/daap-mcp-server-data.zip \
+              --zip-file fileb://lambda-layers/daap-mcp-server-pandas.zip \
               --compatible-runtimes python3.12 \
               --compatible-architectures ${{ env.LAMBDA_ARCHITECTURE }} \
               --query 'LayerVersionArn' \
@@ -104,12 +104,16 @@ jobs:
             echo "DATA_LAYER_ARN=$DATA_LAYER_ARN" >> $GITHUB_ENV
             echo "✅ Data layer uploaded: $DATA_LAYER_ARN"
           else
-            echo "❌ Data layer not found!"
-            exit 1
+            echo "⚠️  Data layer not found, skipping..."
+            echo "DATA_LAYER_ARN=" >> $GITHUB_ENV
           fi
           
           # Combine layer ARNs (boto3 is pre-installed in Lambda)
-          LAYER_ARNS="$CORE_LAYER_ARN $DATA_LAYER_ARN"
+          if [ -n "$DATA_LAYER_ARN" ]; then
+            LAYER_ARNS="$CORE_LAYER_ARN $DATA_LAYER_ARN"
+          else
+            LAYER_ARNS="$CORE_LAYER_ARN"
+          fi
           echo "LAYER_ARNS=$LAYER_ARNS" >> $GITHUB_ENV
           echo "ℹ️ Note: boto3 is pre-installed in AWS Lambda, so no layer needed"
           
@@ -120,7 +124,7 @@ jobs:
       - name: Create minimal deployment package
         run: |
           # Use the minimal package created by layers script
-          cp lambda-layers/mcp-server-minimal.zip mcp-server-deployment.zip
+          cp mcp-lambda-function.zip mcp-server-deployment.zip
           echo "✅ Using minimal deployment package with layers"
 
       - name: Setup IAM and Lambda

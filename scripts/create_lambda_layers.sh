@@ -49,8 +49,8 @@ create_layer() {
     
     echo "🔨 Creating layer: $layer_name"
     
-    # Check if requirements file has actual dependencies (not just comments)
-    if ! grep -q "^[^#]" "$requirements_file"; then
+    # Check if requirements file has actual dependencies (not just comments or empty lines)
+    if [ ! -s "$requirements_file" ] || ! grep -q "^[^#]" "$requirements_file"; then
         echo "⚠️  No dependencies found for $layer_name, skipping..."
         return 0
     fi
@@ -65,48 +65,92 @@ create_layer() {
     # Create layer zip
     cd $layer_dir
     zip -r "../${layer_name}.zip" python/
-    cd ..
+    cd - > /dev/null
     
     # Get layer size
-    layer_size=$(du -h "${layer_name}.zip" | cut -f1)
-    echo "✅ Created $layer_name.zip (Size: $layer_size)"
+    if [ -f "lambda-layers/${layer_name}.zip" ]; then
+        layer_size=$(du -h "lambda-layers/${layer_name}.zip" | cut -f1)
+        echo "✅ Created $layer_name.zip (Size: $layer_size)"
+    else
+        echo "❌ Failed to create $layer_name.zip"
+        return 1
+    fi
 }
 
 # Create multiple layers to stay under 50MB limit
 echo "📦 Creating multiple layers..."
 
+# Get the absolute path to the script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Change to project root to ensure relative paths work
+cd "$PROJECT_ROOT"
+
 # Layer 1: Core MCP dependencies
 echo "📦 Creating Layer 1: Core MCP dependencies..."
-create_layer "${LAYER_NAME_PREFIX}-core" "$REQUIREMENTS_DIR/layer1-core.txt" "$LAYER_DIR/core"
+create_layer "${LAYER_NAME_PREFIX}-fastmcp-urllib3" "$REQUIREMENTS_DIR/layer1-core.txt" "$LAYER_DIR/core"
 
 # Layer 2: Data processing dependencies
 echo "📦 Creating Layer 2: Data processing dependencies..."
-create_layer "${LAYER_NAME_PREFIX}-data" "$REQUIREMENTS_DIR/layer2-data.txt" "$LAYER_DIR/data"
+create_layer "${LAYER_NAME_PREFIX}-pandas" "$REQUIREMENTS_DIR/layer2-data.txt" "$LAYER_DIR/data"
 
 # Create minimal deployment package (only application code)
 echo "📦 Creating minimal deployment package..."
-mkdir -p minimal-package
+mkdir -p lambda-function-code
 
 # Copy application files if they exist
-[ -f "lambda_handler.py" ] && cp lambda_handler.py minimal-package/
-[ -d "tools" ] && cp -r tools/ minimal-package/
-[ -d "utils" ] && cp -r utils/ minimal-package/
+[ -f "lambda_handler.py" ] && cp lambda_handler.py lambda-function-code/
+[ -f "server.py" ] && cp server.py lambda-function-code/
+[ -d "tools" ] && cp -r tools lambda-function-code/
+[ -d "utils" ] && cp -r utils lambda-function-code/
 
-# Create a simple requirements.txt for the minimal package
-cat > minimal-package/requirements.txt << 'EOF'
+# Create a simple requirements.txt for the function code
+cat > lambda-function-code/requirements.txt << 'EOF'
 # Dependencies are provided by Lambda layers
 # Only include packages not in layers if any
 EOF
 
-cd minimal-package
-zip -r "../mcp-server-minimal.zip" .
+cd lambda-function-code
+zip -r "../mcp-lambda-function.zip" .
 cd ..
+
+# Validate that all expected layers were created
+echo "🔍 Validating layer creation..."
+
+# Check for core layer
+if [ ! -f "lambda-layers/daap-mcp-server-fastmcp-urllib3.zip" ]; then
+    echo "❌ Core layer not created!"
+    exit 1
+fi
+
+# Check for data layer
+if [ ! -f "lambda-layers/daap-mcp-server-pandas.zip" ]; then
+    echo "❌ Data layer not created!"
+    exit 1
+fi
+
+# Check for Lambda function code package
+if [ ! -f "mcp-lambda-function.zip" ]; then
+    echo "❌ Lambda function code package not created!"
+    exit 1
+fi
+
+echo "✅ All expected layers created successfully!"
 
 # Get final sizes
 echo "📊 Package sizes:"
-for layer_zip in *.zip; do
-    size=$(du -h "$layer_zip" | cut -f1)
-    echo "  $layer_zip: $size"
+for layer_zip in lambda-layers/*.zip; do
+    if [ -f "$layer_zip" ]; then
+        size=$(du -h "$layer_zip" | cut -f1)
+        echo "  $(basename "$layer_zip"): $size"
+    fi
+done
+for layer_zip in mcp-lambda-function.zip; do
+    if [ -f "$layer_zip" ]; then
+        size=$(du -h "$layer_zip" | cut -f1)
+        echo "  $layer_zip: $size"
+    fi
 done
 
 echo "✅ Lambda layers created successfully!"
@@ -114,9 +158,9 @@ echo ""
 echo "📋 Next steps:"
 echo "1. Upload all layers to AWS Lambda"
 echo "2. Update Lambda function to use all layers"
-echo "3. Deploy minimal package as function code"
+echo "3. Deploy Lambda function code package as function code"
 echo ""
 echo "🔧 Layer ARNs will be needed for Lambda function configuration:"
-echo "   - Core Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-core:1"
-echo "   - Data Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-data:1"
+echo "   - Core Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-fastmcp-urllib3:1"
+echo "   - Data Layer: arn:aws:lambda:REGION:ACCOUNT:layer:${LAYER_NAME_PREFIX}-pandas:1"
 echo "   - Note: boto3 is pre-installed in AWS Lambda, so no layer needed"
