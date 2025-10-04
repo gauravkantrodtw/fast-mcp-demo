@@ -458,13 +458,29 @@ jobs:
             MCP_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part ${{ env.MCP_ENDPOINT_PATH_PART }} --query 'id' --output text)
             HEALTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part health --query 'id' --output text)
             
+            # Create OAuth endpoints
+            OAUTH_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $ROOT_ID --path-part oauth --query 'id' --output text)
+            OAUTH_AUTHORIZE_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $OAUTH_ID --path-part authorize --query 'id' --output text)
+            OAUTH_CALLBACK_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $OAUTH_ID --path-part callback --query 'id' --output text)
+            OAUTH_TOKEN_ID=$(aws apigateway create-resource --rest-api-id $API_ID --parent-id $OAUTH_ID --path-part token --query 'id' --output text)
+            
             # Configure methods
             aws apigateway put-method --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --authorization-type ${{ env.AUTHORIZATION_TYPE }}
             aws apigateway put-method --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --authorization-type ${{ env.AUTHORIZATION_TYPE }}
             
+            # Configure OAuth methods (public endpoints - no IAM auth)
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $OAUTH_AUTHORIZE_ID --http-method GET --authorization-type NONE
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $OAUTH_CALLBACK_ID --http-method GET --authorization-type NONE
+            aws apigateway put-method --rest-api-id $API_ID --resource-id $OAUTH_TOKEN_ID --http-method POST --authorization-type NONE
+            
             # Configure integrations
             aws apigateway put-integration --rest-api-id $API_ID --resource-id $MCP_ID --http-method ${{ env.HTTP_METHOD }} --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
             aws apigateway put-integration --rest-api-id $API_ID --resource-id $HEALTH_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method ${{ env.HTTP_METHOD }} --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            
+            # Configure OAuth integrations
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $OAUTH_AUTHORIZE_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $OAUTH_CALLBACK_ID --http-method GET --type ${{ env.INTEGRATION_TYPE }} --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
+            aws apigateway put-integration --rest-api-id $API_ID --resource-id $OAUTH_TOKEN_ID --http-method POST --type ${{ env.INTEGRATION_TYPE }} --integration-http-method POST --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations"
             
             # Deploy API Gateway
             aws apigateway create-deployment --rest-api-id $API_ID --stage-name ${{ env.API_STAGE_NAME }}
@@ -472,6 +488,7 @@ jobs:
             # Add Lambda permissions
             MCP_STATEMENT_ID="apigateway-invoke-$(date +%s)"
             HEALTH_STATEMENT_ID="apigateway-invoke-health-$(date +%s)"
+            OAUTH_STATEMENT_ID="apigateway-invoke-oauth-$(date +%s)"
             
             aws lambda add-permission \
               --function-name ${{ env.FUNCTION_NAME }} \
@@ -486,6 +503,21 @@ jobs:
               --action lambda:InvokeFunction \
               --principal apigateway.amazonaws.com \
               --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/GET${{ env.HEALTH_ENDPOINT_PATH }}" || echo "Health permission may already exist"
+            
+            # Add OAuth endpoint permissions (all public)
+            aws lambda add-permission \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --statement-id $OAUTH_STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/GET/oauth/*" || echo "OAuth GET permission may already exist"
+            
+            aws lambda add-permission \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --statement-id "${OAUTH_STATEMENT_ID}-post" \
+              --action lambda:InvokeFunction \
+              --principal apigateway.amazonaws.com \
+              --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:$ACCOUNT_ID:$API_ID/*/POST/oauth/*" || echo "OAuth POST permission may already exist"
             
             # Create and attach API Gateway IAM policy
             POLICY_ARN=$(aws iam create-policy \

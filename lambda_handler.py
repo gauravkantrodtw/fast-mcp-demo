@@ -2,13 +2,18 @@
 """
 Direct AWS Lambda handler for FastMCP server without Mangum.
 This bypasses ASGI issues by handling MCP protocol directly.
+Supports External MCP Server authentication (OAuth and PAT).
 """
 
 import logging
 import time
 import json
 import asyncio
+import os
+from urllib.parse import parse_qs, urlparse
 from server import mcp
+from utils.auth import extract_and_validate_auth
+from utils.oauth_handler import oauth_handler
 
 # Configure logging
 logger = logging.getLogger()
@@ -72,9 +77,39 @@ def lambda_handler(event, context):
                 "body": json.dumps({"status": "healthy", "service": "daap-mcp-server"})
             }
         
-        # Handle MCP endpoint
+        # Handle OAuth authorization endpoint
+        elif path == '/oauth/authorize' and http_method == 'GET':
+            return handle_oauth_authorize(event)
+        
+        # Handle OAuth callback endpoint
+        elif path == '/oauth/callback' and http_method == 'GET':
+            return handle_oauth_callback(event)
+        
+        # Handle OAuth token endpoint
+        elif path == '/oauth/token' and http_method == 'POST':
+            return handle_oauth_token(body, headers)
+        
+        # Handle MCP endpoint (requires authentication for external clients)
         elif path == '/mcp' and http_method == 'POST':
-            return handle_mcp_request(body, headers)
+            # Authenticate request for external MCP clients
+            is_authenticated, user_info, error_msg = extract_and_validate_auth(headers)
+            
+            if not is_authenticated:
+                logger.warning(f"Authentication failed: {error_msg}")
+                return {
+                    "statusCode": 401,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "WWW-Authenticate": "Bearer realm=\"Databricks MCP Server\""
+                    },
+                    "body": json.dumps({
+                        "error": "Unauthorized",
+                        "message": error_msg or "Authentication required"
+                    })
+                }
+            
+            logger.info(f"Request authenticated for user: {user_info.get('user_id', 'unknown')}")
+            return handle_mcp_request(body, headers, user_info)
         
         # Handle CORS preflight
         elif http_method == 'OPTIONS':
@@ -107,8 +142,8 @@ def lambda_handler(event, context):
     finally:
         logger.info(f"Processed request in {time.time() - start_time:.3f}s")
 
-def handle_mcp_request(body, headers):
-    """Handle MCP protocol requests directly."""
+def handle_mcp_request(body, headers, user_info=None):
+    """Handle MCP protocol requests directly with user context."""
     try:
         # Parse MCP request
         if not body:
@@ -389,6 +424,317 @@ async def process_mcp_request(request):
                     "details": str(e)
                 }
             }
+        }
+
+def handle_oauth_authorize(event):
+    """
+    Handle OAuth authorization endpoint.
+    Redirects to callback endpoint or external redirect_uri with authorization code.
+    """
+    try:
+        # Parse query parameters
+        query_params = event.get('queryStringParameters', {}) or {}
+        
+        client_id = query_params.get('client_id')
+        redirect_uri = query_params.get('redirect_uri')
+        state = query_params.get('state')
+        scope = query_params.get('scope', 'all-apis')
+        code_challenge = query_params.get('code_challenge')
+        code_challenge_method = query_params.get('code_challenge_method', 'S256')
+        
+        if not client_id:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": "invalid_request",
+                    "error_description": "Missing client_id"
+                })
+            }
+        
+        # If no redirect_uri provided, use API Gateway callback
+        api_gateway_url = os.environ.get('API_GATEWAY_URL', event.get('headers', {}).get('host', ''))
+        if not redirect_uri:
+            # Get the base URL from the request
+            protocol = event.get('headers', {}).get('x-forwarded-proto', 'https')
+            host = event.get('headers', {}).get('host', api_gateway_url)
+            redirect_uri = f"{protocol}://{host}/oauth/callback"
+        
+        # Generate authorization code
+        auth_code = oauth_handler._generate_token()
+        
+        # Store authorization code
+        success, error = oauth_handler.handle_authorization_callback(
+            auth_code, client_id, redirect_uri, state
+        )
+        
+        if not success:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": "invalid_request",
+                    "error_description": error
+                })
+            }
+        
+        # Build redirect URL with authorization code
+        redirect_params = f"code={auth_code}"
+        if state:
+            redirect_params += f"&state={state}"
+        
+        separator = "&" if "?" in redirect_uri else "?"
+        redirect_url = f"{redirect_uri}{separator}{redirect_params}"
+        
+        logger.info(f"OAuth authorization successful for client: {client_id}, redirecting to: {redirect_uri}")
+        
+        # Return redirect response
+        return {
+            "statusCode": 302,
+            "headers": {
+                "Location": redirect_url,
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": ""
+        }
+    
+    except Exception as e:
+        logger.error(f"OAuth authorize error: {str(e)}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "server_error",
+                "error_description": str(e)
+            })
+        }
+
+def handle_oauth_callback(event):
+    """
+    Handle OAuth callback endpoint.
+    Used by Databricks and external OAuth clients to receive authorization codes.
+    This endpoint should be registered in Databricks OAuth App Connection as redirect_uri.
+    """
+    try:
+        query_params = event.get('queryStringParameters', {}) or {}
+        
+        code = query_params.get('code')
+        state = query_params.get('state')
+        error = query_params.get('error')
+        error_description = query_params.get('error_description')
+        
+        if error:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "error": error,
+                    "error_description": error_description or "Authorization failed",
+                    "state": state
+                })
+            }
+        
+        if not code:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "error": "invalid_request",
+                    "error_description": "Missing authorization code"
+                })
+            }
+        
+        # Return success with authorization code
+        # External clients (Claude, Cursor, MCP Inspector) will use this code
+        # to exchange for access token via POST /oauth/token
+        logger.info(f"OAuth callback received with code, state: {state}")
+        
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "code": code,
+                "state": state,
+                "message": "Authorization successful. Exchange code for access token via POST /oauth/token"
+            })
+        }
+    
+    except Exception as e:
+        logger.error(f"OAuth callback error: {str(e)}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "error": "server_error",
+                "error_description": str(e)
+            })
+        }
+
+def handle_oauth_token(body, headers):
+    """
+    Handle OAuth token endpoint.
+    Exchanges authorization code for access token or refreshes token.
+    """
+    try:
+        # Parse request body
+        if not body:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": "invalid_request",
+                    "error_description": "Missing request body"
+                })
+            }
+        
+        # Parse form data or JSON
+        content_type = headers.get('content-type', '').lower()
+        
+        if 'application/x-www-form-urlencoded' in content_type:
+            params = parse_qs(body)
+            # parse_qs returns lists, get first value
+            token_params = {k: v[0] if isinstance(v, list) else v for k, v in params.items()}
+        else:
+            token_params = json.loads(body)
+        
+        grant_type = token_params.get('grant_type')
+        client_id = token_params.get('client_id')
+        
+        if not grant_type or not client_id:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": "invalid_request",
+                    "error_description": "Missing grant_type or client_id"
+                })
+            }
+        
+        # Handle authorization code flow
+        if grant_type == 'authorization_code':
+            code = token_params.get('code')
+            redirect_uri = token_params.get('redirect_uri')
+            code_verifier = token_params.get('code_verifier')
+            client_secret = token_params.get('client_secret')
+            
+            if not code:
+                return {
+                    "statusCode": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "error": "invalid_request",
+                        "error_description": "Missing authorization code"
+                    })
+                }
+            
+            success, token_response, error = oauth_handler.exchange_code_for_token(
+                code, client_id, client_secret, redirect_uri, code_verifier
+            )
+            
+            if not success:
+                return {
+                    "statusCode": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "error": "invalid_grant",
+                        "error_description": error
+                    })
+                }
+            
+            logger.info(f"Issued access token for client: {client_id}")
+            
+            return {
+                "statusCode": 200,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache"
+                },
+                "body": json.dumps(token_response)
+            }
+        
+        # Handle refresh token flow
+        elif grant_type == 'refresh_token':
+            refresh_token = token_params.get('refresh_token')
+            client_secret = token_params.get('client_secret')
+            
+            if not refresh_token:
+                return {
+                    "statusCode": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "error": "invalid_request",
+                        "error_description": "Missing refresh_token"
+                    })
+                }
+            
+            success, token_response, error = oauth_handler.refresh_access_token(
+                refresh_token, client_id, client_secret
+            )
+            
+            if not success:
+                return {
+                    "statusCode": 400,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "error": "invalid_grant",
+                        "error_description": error
+                    })
+                }
+            
+            logger.info(f"Refreshed access token for client: {client_id}")
+            
+            return {
+                "statusCode": 200,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache"
+                },
+                "body": json.dumps(token_response)
+            }
+        
+        else:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": "unsupported_grant_type",
+                    "error_description": f"Grant type '{grant_type}' is not supported"
+                })
+            }
+    
+    except json.JSONDecodeError as e:
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "invalid_request",
+                "error_description": f"Invalid JSON: {str(e)}"
+            })
+        }
+    except Exception as e:
+        logger.error(f"OAuth token error: {str(e)}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "server_error",
+                "error_description": str(e)
+            })
         }
 
 # Local test mode

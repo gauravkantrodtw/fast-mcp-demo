@@ -8,6 +8,9 @@ A lightweight MCP (Model Context Protocol) server for CSV analysis, deployable t
 - **S3 CSV Tools**: Read and analyze CSV files directly from AWS S3
 - **AWS Lambda Deployment**: Serverless deployment with API Gateway
 - **Cursor Integration**: Works with Cursor IDE via MCP proxy
+- **External MCP Server**: OAuth 2.0 support for Claude, Cursor, MCP Inspector
+- **Secure Authentication**: Both OAuth and Personal Access Token (PAT) support
+- **Databricks Compatible**: Works as External MCP Server with Unity Catalog
 - **Configurable**: Environment-based configuration
 
 ## Configuration
@@ -17,6 +20,10 @@ A lightweight MCP (Model Context Protocol) server for CSV analysis, deployable t
 - `MCP_SERVER_URL`: Your deployed MCP server URL (default: current Lambda URL)
 - `AWS_PROFILE`: AWS profile for local development
 - `AWS_REGION`: AWS region (default: eu-central-1)
+- `DATABRICKS_WORKSPACE_HOSTNAME`: Your Databricks workspace hostname (for OAuth)
+- `OAUTH_ACCESS_TOKEN_TTL_MINUTES`: OAuth access token TTL in minutes (default: 60)
+- `OAUTH_REFRESH_TOKEN_TTL_MINUTES`: OAuth refresh token TTL in minutes (default: 10080)
+- `DEV_PAT_TOKEN`: Personal Access Token for development/testing
 
 ### Setup
 
@@ -88,6 +95,15 @@ analyze_s3_csv("my-bucket", "data/sales.csv")
 # Go to Actions → Cleanup AWS Resources → Run workflow
 # Type "DELETE" when prompted
 ```
+
+### External MCP Server (OAuth)
+
+Supports OAuth 2.0 authentication for external clients (Claude, Cursor, MCP Inspector).
+
+**Endpoints:**
+- `GET /oauth/authorize` - OAuth authorization
+- `POST /oauth/token` - Token exchange/refresh
+- `POST /mcp` - MCP endpoint (requires Bearer token)
 
 ### Cursor Integration
 
