@@ -31,7 +31,7 @@ def get_system_status() -> dict:
         "status": "operational",
         "service": "daap-mcp-server",
         "version": "1.0.0",
-        "tools_available": 3,
+        "tools_available": 6,
         "uptime": "active"
     }
 
@@ -47,9 +47,12 @@ def get_server_info() -> dict:
             "logging": True
         },
         "supported_tools": [
+            "summarize_csv_file",
+            "analyze_s3_csv",
             "say_hello",
             "say_goodbye", 
-            "get_greeting_info"
+            "get_greeting_info",
+            "run_sql"
         ]
     }
 
